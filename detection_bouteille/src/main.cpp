@@ -1,6 +1,6 @@
 #include <Arduino.h>
 
-// test commit
+
 
 // --- Configuration ---
 const int PIN_CAPTEUR_IR = 4;  // la broche OUT 
