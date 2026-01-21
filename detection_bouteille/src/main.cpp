@@ -1,5 +1,5 @@
 #include <Arduino.h>
-// etst
+
 // --- Configuration ---
 const int PIN_CAPTEUR_IR = 4;  // la broche OUT 
 const int DELAI_ANTI_REBOND = 500; // ms pour éviter les doubles détections
