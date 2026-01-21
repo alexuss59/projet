@@ -1,37 +1,76 @@
 #include <Arduino.h>
+#include "esp_timer.h"
 
-// --- Configuration ---
-const int PIN_CAPTEUR_IR = 4;  // la broche OUT 
-const int DELAI_ANTI_REBOND = 500; // ms pour éviter les doubles détections
+const int PIN_CAPTEUR_IR = 4; 
+const uint64_t DELAI_FILTRE_US = 400 * 1000; 
 
-// --- Variables Volatiles (Modifiées par l'interruption) ---
-volatile bool bouteilleDetectee = false;
-volatile unsigned long dernierTempsDetection = 0;
+esp_timer_handle_t timer_filtre_handle; 
+portMUX_TYPE myMux = portMUX_INITIALIZER_UNLOCKED;
 
-// C'est la "clé" qui permet de verrouiller la mémoire
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool event_bouteille_arrivee = false;
+volatile bool event_bouteille_partie = false;
+volatile bool bouteille_en_cours = false; 
 
-// --- Interruption (ISR) ---
-// IRAM_ATTR pour que le code soit en RAM (rapide)
-void IRAM_ATTR isr_detection_IR() {
-  unsigned long tempsActuel = millis();
+void IRAM_ATTR on_timer_fin_bouteille(void* arg) {
+  portENTER_CRITICAL_ISR(&myMux);
+  event_bouteille_partie = true;
+  portEXIT_CRITICAL_ISR(&myMux);
+}
+
+void IRAM_ATTR isr_capteur_change() {
+  int niveau = digitalRead(PIN_CAPTEUR_IR); 
   
-  // Anti-rebond logiciel simple
-  if (tempsActuel - dernierTempsDetection > DELAI_ANTI_REBOND) {
-    bouteilleDetectee = true;
-    dernierTempsDetection = tempsActuel;
+  if (niveau == LOW) {
+    esp_timer_stop(timer_filtre_handle);
+    
+    if (!bouteille_en_cours) {
+      bouteille_en_cours = true;
+      portENTER_CRITICAL_ISR(&myMux);
+      event_bouteille_arrivee = true;
+      portEXIT_CRITICAL_ISR(&myMux);
+    }
+  } 
+  else {
+    esp_timer_start_once(timer_filtre_handle, DELAI_FILTRE_US);
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  
-  // INPUT_PULLUP
   pinMode(PIN_CAPTEUR_IR, INPUT_PULLUP);
 
-  // Attacher l'interruption
-  // FALLING = Le signal passe de HIGH (3.3V) à LOW (0V) quand un obstacle est vu
-  attachInterrupt(digitalPinToInterrupt(PIN_CAPTEUR_IR), isr_detection_IR, FALLING);
+  const esp_timer_create_args_t timer_args = {
+    .callback = &on_timer_fin_bouteille,
+    .name = "timer_filtre_ir"
+  };
+  esp_timer_create(&timer_args, &timer_filtre_handle);
 
-  Serial.println("Système prêt. En attente de bouteille...");
+  attachInterrupt(digitalPinToInterrupt(PIN_CAPTEUR_IR), isr_capteur_change, CHANGE);
+}
+
+void loop() {
+  bool debut = false;
+  bool fin = false;
+
+  portENTER_CRITICAL(&myMux);
+  if (event_bouteille_arrivee) {
+    debut = true;
+    event_bouteille_arrivee = false;
+  }
+  if (event_bouteille_partie) {
+    fin = true;
+    event_bouteille_partie = false;
+    bouteille_en_cours = false; 
+  }
+  portEXIT_CRITICAL(&myMux);
+
+  if (debut) {
+    Serial.println(">>> DEBUT DETECTION");
+  }
+
+  if (fin) {
+    Serial.println("<<< FIN DETECTION");
+  }
+  
+  delay(1); 
 }
