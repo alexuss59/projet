@@ -1,3 +1,5 @@
+//led strip
+
 #include <Arduino.h>
 // Pour adapter la lib FastLED à l'ESP
 #define FASTLED_ESP32_RAW_PIN_ORDER
