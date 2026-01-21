@@ -1,3 +1,5 @@
+// rj45 v1
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <Ethernet.h>
