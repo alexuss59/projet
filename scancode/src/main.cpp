@@ -1,36 +1,36 @@
 #include <Arduino.h>
 
-// --- PINS (ESP32-S3) ---
-// Attention : On croise toujours TX et RX !
-const int PIN_RX_ESP = 18; // Brancher le fil TX du scanner ici
-const int PIN_TX_ESP = 17; // Brancher le fil RX du scanner ici
+// --- Configuration ---
+const int PIN_RX_SCANNER = 18; //(TX du scanner)
+const int PIN_TX_SCANNER = 17; //(RX du scanner)
 
-// Création de l'interface série matérielle n°1
+// Création de l'interface pour le scanner
 HardwareSerial ScannerSerial(1); 
 
 void setup() {
-  // 1. Console pour le PC
+  
   Serial.begin(115200);
-  
-  // 2. Console pour le Scanner (9600 bauds est le standard usine)
-  ScannerSerial.begin(115200, SERIAL_8N1, PIN_RX_ESP, PIN_TX_ESP);
-  
-  Serial.println("--- TEST SCANNER SEUL ---");
-  Serial.println("Scanne un code-barre maintenant...");
+  delay(2000); // Laisse le temps à l'USB de se connecter
+  Serial.println("--- TEST SCANNER SEUL (Waveshare 9600) ---");
+
+  // 2. Scanner (UART)
+  // Vitesse 9600 imposée par ton manuel Waveshare V2.1 [Page 14]
+  ScannerSerial.begin(9600, SERIAL_8N1, PIN_RX_SCANNER, PIN_TX_SCANNER);
 }
 
 void loop() {
-  // Si le scanner envoie des données
+  // Si le scanner envoie quelque chose
   if (ScannerSerial.available()) {
     
-    // On lit toute la chaîne jusqu'au retour à la ligne (\r)
+    // On lit jusqu'au retour à la ligne (\r)
     String codeBarre = ScannerSerial.readStringUntil('\r');
     
-    // On nettoie les espaces vides au début ou à la fin
+    // On nettoie les espaces inutiles
     codeBarre.trim();
     
+    // On affiche
     if (codeBarre.length() > 0) {
-      Serial.print("CODE REÇU : ");
+      Serial.print("Code lu : ");
       Serial.println(codeBarre);
     }
   }
