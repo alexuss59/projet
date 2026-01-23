@@ -1,71 +1,102 @@
 #include <Arduino.h>
 #include <FastLED.h>
 
-// --- CONFIGURATION ---
+// --- 1. CONFIGURATION ---
 const int PIN_IR_ENTREE = 6;
 const int PIN_LEDS = 7;
 const int NUM_LEDS = 10;
-
 const int PIN_RX_SCANNER = 18; 
 const int PIN_TX_SCANNER = 17; 
 
-// --- COMMANDES WAVESHARE V2.1 (Page 25 & 81) ---
-// Format : Header(2) + Type(1) + Len(1) + Address(2) + Data(1) + CRC(2)
-// On utilise le CRC "Magique" AB CD pour ne pas avoir à le calculer [cite: 5705]
+// --- 2. GESTION CRITIQUE (Ce que tes profs attendent) ---
+// "volatile" est OBLIGATOIRE car cette variable est modifiée par l'interruption
+volatile bool flag_demande_scan = false;
 
-// Start Scan : Ecrire '1' à l'adresse 0x0002
+// Le "Verrou" (Spinlock) pour protéger l'accès à la variable
+portMUX_TYPE monVerrou = portMUX_INITIALIZER_UNLOCKED;
+
+// --- 3. COMMANDES WAVESHARE V2.1 (Page 25) ---
 const byte CMD_START_SCAN[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
-
-// Stop Scan : Ecrire '0' à l'adresse 0x0002
 const byte CMD_STOP_SCAN[]  = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x00, 0xAB, 0xCD};
 
+// --- 4. OBJETS & VARIABLES ---
 CRGB leds[NUM_LEDS];
 HardwareSerial ScannerSerial(1); 
 
-// États
 enum Etat { ATTENTE, SCAN_EN_COURS, VALIDATION, ERREUR, ATTENTE_RETRAIT };
 Etat etatActuel = ATTENTE;
 unsigned long debutScan = 0;
 const long TIMEOUT_SCAN = 3000; 
 
-// --- UTILITAIRES ---
-void allumerLeds(CRGB c) { for(int i=0; i<NUM_LEDS; i++) leds[i] = c; FastLED.show(); }
-void clignoter(CRGB c) { for(int i=0; i<3; i++) { allumerLeds(CRGB::Black); delay(100); allumerLeds(c); delay(100); } }
+// --- 5. INTERRUPTION (ISR) ---
+// Cette fonction s'exécute en quelques microsecondes dès que le capteur change
+void IRAM_ATTR isr_detection() {
+  // DÉBUT ZONE CRITIQUE (ISR)
+  // On bloque tout le reste pour écrire dans la variable en sécurité
+  portENTER_CRITICAL_ISR(&monVerrou);
+  
+  flag_demande_scan = true;
+  
+  portEXIT_CRITICAL_ISR(&monVerrou);
+  // FIN ZONE CRITIQUE
+}
 
-// Envoi de commande brute (Hexadécimal)
+// --- UTILITAIRES ---
 void envoyerCommande(const byte* cmd, int taille) {
   ScannerSerial.write(cmd, taille);
+}
+
+void allumerLeds(CRGB c) { for(int i=0; i<NUM_LEDS; i++) leds[i] = c; FastLED.show(); }
+void clignoter(CRGB c) { 
+  for(int i=0; i<3; i++) { allumerLeds(CRGB::Black); delay(100); allumerLeds(c); delay(100); } 
 }
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("--- SYSTEME V2.1 (HEXADECIMAL) ---");
+  Serial.println("--- SYSTEME PRO (Critical & Hex) ---");
 
-  // Init Scanner 9600 (Waveshare V2.1 standard)
+  // Init Scanner 9600 (Waveshare V2.1)
   ScannerSerial.begin(9600, SERIAL_8N1, PIN_RX_SCANNER, PIN_TX_SCANNER);
 
+  // Init Capteur & Interruption
   pinMode(PIN_IR_ENTREE, INPUT_PULLUP);
+  // On attache l'interruption sur le front descendant (FALLING) = Passage de 3.3V à 0V
+  attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), isr_detection, FALLING);
+
+  // Init LEDs
   FastLED.addLeds<WS2812B, PIN_LEDS, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(40);
   
-  // On s'assure qu'il est éteint au démarrage
+  // Sécurité démarrage
   envoyerCommande(CMD_STOP_SCAN, sizeof(CMD_STOP_SCAN));
   allumerLeds(CRGB::Green);
 }
 
 void loop() {
-  bool bouteilleLa = (digitalRead(PIN_IR_ENTREE) == LOW);
+  // Lecture sécurisée du Flag
+  bool demandeScan = false;
 
+  // DÉBUT ZONE CRITIQUE (LOOP)
+  // On verrouille juste le temps de lire et remettre à zéro le flag
+  portENTER_CRITICAL(&monVerrou);
+  if (flag_demande_scan) {
+    demandeScan = true;
+    if (etatActuel == ATTENTE) {
+        flag_demande_scan = false; // On consomme l'info
+    }
+  }
+  portEXIT_CRITICAL(&monVerrou);
+  // FIN ZONE CRITIQUE
+
+  
   switch (etatActuel) {
 
     case ATTENTE:
-      if (bouteilleLa) {
-        Serial.println(">>> DETECTÉ -> SCAN (HEX)");
+      if (demandeScan) {
+        Serial.println(">>> INTERRUPT : Demande de scan reçue !");
         
-        while(ScannerSerial.available()) ScannerSerial.read(); // Vider buffer
-        
-        // ENVOI DE LA COMMANDE HEX POUR ALLUMER
+        while(ScannerSerial.available()) ScannerSerial.read(); 
         envoyerCommande(CMD_START_SCAN, sizeof(CMD_START_SCAN));
         
         etatActuel = SCAN_EN_COURS;
@@ -75,37 +106,31 @@ void loop() {
       break;
 
     case SCAN_EN_COURS:
-      // A. Lecture du code
+      // Lecture du code
       if (ScannerSerial.available()) {
-        // Le scanner peut répondre "02 00 00 01 00 33 31" pour dire "Ok j'ai reçu l'ordre"
-        // On doit filtrer ça et chercher le vrai code-barre.
-        
-        // Pour faire simple ici : on lit tout. Si c'est long (>7 caractères), c'est probablement un code-barre.
-        // Si c'est court (7 bytes), c'est juste l'acquittement de commande.
         String data = ScannerSerial.readStringUntil('\r');
         data.trim();
-        
-        // On ignore les réponses de commande (souvent commencent par un caractère non imprimable ou sont courtes)
+        // Filtre les réponses courtes (acquittement commande)
         if (data.length() > 7) { 
-           Serial.print(">>> CODE : "); Serial.println(data);
-           
-           envoyerCommande(CMD_STOP_SCAN, sizeof(CMD_STOP_SCAN)); // On éteint
+           Serial.print(">>> CODE LU : "); Serial.println(data);
+           envoyerCommande(CMD_STOP_SCAN, sizeof(CMD_STOP_SCAN)); 
            etatActuel = VALIDATION;
         }
       }
       
-      // B. Timeout
+      // Timeout
       if (millis() - debutScan > TIMEOUT_SCAN) {
         Serial.println("!!! TIMEOUT");
-        envoyerCommande(CMD_STOP_SCAN, sizeof(CMD_STOP_SCAN)); // On éteint de force
+        envoyerCommande(CMD_STOP_SCAN, sizeof(CMD_STOP_SCAN));
         etatActuel = ERREUR;
       }
-
-      // C. Retrait
-      if (!bouteilleLa) {
-        envoyerCommande(CMD_STOP_SCAN, sizeof(CMD_STOP_SCAN));
-        etatActuel = ATTENTE;
-        allumerLeds(CRGB::Green);
+      
+      // Si la bouteille est retirée (Lecture capteur physique pour le retrait)
+      if (digitalRead(PIN_IR_ENTREE) == HIGH) {
+         // Petite sécurité : si on retire pendant le scan, on annule
+         envoyerCommande(CMD_STOP_SCAN, sizeof(CMD_STOP_SCAN));
+         etatActuel = ATTENTE;
+         allumerLeds(CRGB::Green);
       }
       break;
 
@@ -121,7 +146,15 @@ void loop() {
 
     case ATTENTE_RETRAIT:
       allumerLeds(CRGB::Blue);
-      if (!bouteilleLa) {
+      // On attend que le capteur physique remonte à HIGH (plus d'obstacle)
+      if (digitalRead(PIN_IR_ENTREE) == HIGH) {
+        Serial.println("--- PRET ---");
+        
+        // On nettoie le flag au cas où une interruption aurait eu lieu pendant le retrait
+        portENTER_CRITICAL(&monVerrou);
+        flag_demande_scan = false;
+        portEXIT_CRITICAL(&monVerrou);
+        
         etatActuel = ATTENTE;
         allumerLeds(CRGB::Green);
       }
