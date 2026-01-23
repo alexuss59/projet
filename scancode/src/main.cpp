@@ -14,7 +14,6 @@ void setup() {
   Serial.println("--- TEST SCANNER SEUL (Waveshare 9600) ---");
 
   // 2. Scanner (UART)
-  // Vitesse 9600 imposée par ton manuel Waveshare V2.1 [Page 14]
   ScannerSerial.begin(9600, SERIAL_8N1, PIN_RX_SCANNER, PIN_TX_SCANNER);
 }
 
