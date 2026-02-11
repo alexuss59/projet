@@ -9,7 +9,7 @@
 // ================= CONFIGURATION MATÉRIELLE =================
 #define W5500_CS_PIN 10 // Pin CS Ethernet
 #define LED_PIN 7
-#define NUM_LEDS 10
+#define NUM_LEDS 27
 #define SCANNER_RX_PIN 17
 #define SCANNER_TX_PIN 18
 
@@ -23,10 +23,9 @@
 #define PIN_IR_VALIDATION_1 2
 #define PIN_IR_VALIDATION_2 3
 
-// Pilotage Moteur (Pont en H)
-#define MOTEUR_PWM 5
-#define MOTEUR_DIR1 6
-#define MOTEUR_DIR2 11
+// Pilotage Moteur
+#define MOTEUR_DIR1 20
+#define MOTEUR_DIR2 21
 
 // Commande HEX pour déclencher le scan (Manuel Page 25)
 const byte COMMAND_TRIGGER[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
@@ -92,20 +91,15 @@ void piloterMoteur(int sens)
   if (sens == 1)
   {
     digitalWrite(MOTEUR_DIR1, HIGH);
-    digitalWrite(MOTEUR_DIR2, LOW);
-    analogWrite(MOTEUR_PWM, 200);
   }
   else if (sens == -1)
   {
-    digitalWrite(MOTEUR_DIR1, LOW);
     digitalWrite(MOTEUR_DIR2, HIGH);
-    analogWrite(MOTEUR_PWM, 200);
   }
   else
   {
-    digitalWrite(MOTEUR_DIR1, LOW);
     digitalWrite(MOTEUR_DIR2, LOW);
-    analogWrite(MOTEUR_PWM, 0);
+    digitalWrite(MOTEUR_DIR1, LOW);
   }
 }
 
@@ -200,7 +194,6 @@ void setup()
   Serial.begin(115200);
   Wire.begin(SDA_PIN_sfr02, SCL_PIN_sfr02); // Initialisation I2C pour SRF02
 
-  pinMode(MOTEUR_PWM, OUTPUT);
   pinMode(MOTEUR_DIR1, OUTPUT);
   pinMode(MOTEUR_DIR2, OUTPUT);
   pinMode(PIN_IR_ENTREE, INPUT_PULLUP);
@@ -286,11 +279,11 @@ void loop()
       while (ScannerSerial.available())
         ScannerSerial.read();
 
-      Serial.println(">>> REVEIL + TRIGGER...");
+      Serial.println(">>> REVEIL");
 
       // 1. On envoie un octet nul pour réveiller le module
       ScannerSerial.write(0x00);
-      delay(50); // On lui laisse 50ms pour ouvrir les yeux
+      delay(50); // On lui laisse 50ms
 
       // 2. On envoie la vraie commande
       ScannerSerial.write(COMMAND_TRIGGER, sizeof(COMMAND_TRIGGER));
@@ -299,7 +292,7 @@ void loop()
       timerEtat = millis();
     }
 
-    // 2. Gestion du Timeout (3 secondes - CDC)
+    // 2. Gestion du Timeout (3 secondes)
     if (millis() - timerEtat > 3000)
     {
       Serial.println(">>> Timeout (3s) ! Aucune bouteille lue.");
