@@ -1,26 +1,23 @@
-/*
-  PROJET : Bornes de collecte des bouteilles PET 2026
-  CIBLE : ESP32 (Étudiant 2 - Traitement des bouteilles)
-  VERSION : 100% ETHERNET W5500 (Sans WiFi)
-*/
 
 #include <SPI.h>
 #include <Ethernet.h>
 #include <FastLED.h>
 #include <PubSubClient.h>
-#include "esp_system.h" // Pour esp_read_mac
+#include <Wire.h>          // Pour le capteur SRF02 (I2C)
+#include "esp_system.h"    // Pour la lecture de la MAC d'usine
 
 // ================= CONFIGURATION MATÉRIELLE =================
-#define LED_PIN         4
-#define NUM_LEDS        8  
-#define SCANNER_RX_PIN  16 
-#define SCANNER_TX_PIN  17 
-#define TRIGGER_PIN     13
-#define ECHO_PIN        12
-const int PIN_CS_ETHERNET = 10; // Pin CS du module W5500
+#define W5500_CS_PIN    10   // Pin CS Ethernet
+#define LED_PIN         7
+#define NUM_LEDS        10  
+#define SCANNER_RX_PIN  17 
+#define SCANNER_TX_PIN  18 
 
-// ===== CAPTEURS IR (3 capteurs) =====
-#define PIN_IR_ENTREE         14  
+// I2C pour SRF02 : SDA=21, SCL=22 (par défaut sur ESP32)
+#define SRF02_ADDR      0x70 
+
+// Capteurs IR
+#define PIN_IR_ENTREE         6  
 #define PIN_IR_VALIDATION_1   27  
 #define PIN_IR_VALIDATION_2   26  
 
@@ -32,47 +29,65 @@ const int PIN_CS_ETHERNET = 10; // Pin CS du module W5500
 HardwareSerial ScannerSerial(2);
 CRGB leds[NUM_LEDS];
 
-// ================= VARIABLES CRITIQUES =================
+// ================= VARIABLES SYSTÈME =================
 portMUX_TYPE myMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool interruptionEntree = false;
 
-// ================= ÉTATS DU SYSTÈME =================
 enum State {
-  BORNE_PRETE,        
-  BOUTEILLE_DETECTEE, 
-  SCAN_EN_COURS,      
-  DEPOT_VALIDE,       
-  DEPOT_REFUSE,       
-  BAC_PLEIN           
+  BORNE_PRETE,        // Vert fixe
+  BOUTEILLE_DETECTEE, // Bleu fixe
+  SCAN_EN_COURS,      // Bleu clignotant
+  DEPOT_VALIDE,       // Bleu clignotant
+  DEPOT_REFUSE,       // Rouge clignotant
+  BAC_PLEIN           // Rouge fixe
 };
 
 volatile State currentState = BORNE_PRETE;
 unsigned long timerEtat = 0;
 bool clignotementState = false;
 
-bool validation1_detectee = false;
-bool validation2_detectee = false;
-bool bouteille_validee = false;
-bool scanner_actif = true;
+bool v1_ok = false, v2_ok = false, bouteille_validee = false;
 
 // ================= RÉSEAU & MQTT =================
-IPAddress server(192, 168, 1, 20); // IP de la Raspberry Pi 5
-EthernetClient ethClient;          // REMPLACÉ : WiFiClient -> EthernetClient
+IPAddress server(192, 168, 1, 100); // Raspberry Pi 5
+EthernetClient ethClient;
 PubSubClient mqttClient(ethClient);
 
+// ================= FONCTION SRF02 (I2C) =================
+int lireSRF02() {
+  // 1. Lancement de la mesure en cm (commande 0x51)
+  Wire.beginTransmission(SRF02_ADDR);
+  Wire.write(0x00); 
+  Wire.write(0x51); 
+  Wire.endTransmission();
+
+  // 2. Le SRF02 a besoin de 70ms pour mesurer
+  delay(70); 
+
+  // 3. Lecture du résultat (registres 2 et 3)
+  Wire.beginTransmission(SRF02_ADDR);
+  Wire.write(0x02); 
+  Wire.endTransmission();
+
+  Wire.requestFrom(SRF02_ADDR, 2);
+  if (Wire.available() >= 2) {
+    byte high = Wire.read();
+    byte low = Wire.read();
+    return (high << 8) | low;
+  }
+  return -1;
+}
+
 // ================= FONCTIONS MOTEUR =================
-void piloterMoteur(int sens) {
+void piloterMoteur(int sens) { // 1:Avant, -1:Arrière, 0:Stop
   if (sens == 1) {
-    digitalWrite(MOTEUR_DIR1, HIGH);
-    digitalWrite(MOTEUR_DIR2, LOW);
+    digitalWrite(MOTEUR_DIR1, HIGH); digitalWrite(MOTEUR_DIR2, LOW);
     analogWrite(MOTEUR_PWM, 200);
   } else if (sens == -1) {
-    digitalWrite(MOTEUR_DIR1, LOW);
-    digitalWrite(MOTEUR_DIR2, HIGH);
+    digitalWrite(MOTEUR_DIR1, LOW); digitalWrite(MOTEUR_DIR2, HIGH);
     analogWrite(MOTEUR_PWM, 200);
   } else {
-    digitalWrite(MOTEUR_DIR1, LOW);
-    digitalWrite(MOTEUR_DIR2, LOW);
+    digitalWrite(MOTEUR_DIR1, LOW); digitalWrite(MOTEUR_DIR2, LOW);
     analogWrite(MOTEUR_PWM, 0);
   }
 }
@@ -110,14 +125,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (msg == "OK") {
     currentState = DEPOT_VALIDE;
     timerEtat = millis();
-    validation1_detectee = false;
-    validation2_detectee = false;
-    bouteille_validee = false;
-    piloterMoteur(1); 
+    v1_ok = false; v2_ok = false; bouteille_validee = false;
+    piloterMoteur(1); // Marche avant
   } else {
     currentState = DEPOT_REFUSE;
     timerEtat = millis();
-    piloterMoteur(-1);
+    piloterMoteur(-1); // Marche arrière (3s CDC)
   }
   portEXIT_CRITICAL(&myMux);
 }
@@ -125,189 +138,127 @@ void callback(char* topic, byte* payload, unsigned int length) {
 // ================= INTERRUPTION =================
 void IRAM_ATTR ISR_Entree() {
   portENTER_CRITICAL_ISR(&myMux);
-  if (currentState == BORNE_PRETE) {
-    interruptionEntree = true;
-  }
+  if (currentState == BORNE_PRETE) interruptionEntree = true;
   portEXIT_CRITICAL_ISR(&myMux);
 }
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== ESP32 Etudiant2 - Démarrage ETHERNET ===");
-  
-  pinMode(MOTEUR_PWM, OUTPUT); 
-  pinMode(MOTEUR_DIR1, OUTPUT); 
-  pinMode(MOTEUR_DIR2, OUTPUT);
+  Wire.begin(); // Initialisation I2C pour SRF02
+
+  pinMode(MOTEUR_PWM, OUTPUT); pinMode(MOTEUR_DIR1, OUTPUT); pinMode(MOTEUR_DIR2, OUTPUT);
   pinMode(PIN_IR_ENTREE, INPUT_PULLUP);
   pinMode(PIN_IR_VALIDATION_1, INPUT_PULLUP);
   pinMode(PIN_IR_VALIDATION_2, INPUT_PULLUP);
-  pinMode(TRIGGER_PIN, OUTPUT); 
-  pinMode(ECHO_PIN, INPUT);
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-  fill_solid(leds, NUM_LEDS, CRGB::Orange);
-  FastLED.show();
   
-  // 1. Initialiser Ethernet
-  Ethernet.init(PIN_CS_ETHERNET);
-
-  // 2. Récupérer la MAC unique du processeur (méthode native ESP32)
+  // Ethernet & MAC
+  Ethernet.init(W5500_CS_PIN);
   byte mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA); 
-  mac[5] += 1; // Incrémentation pour l'ID Ethernet
+  mac[5] += 1; // MAC Ethernet unique
 
-  Serial.print("MAC Adresse Ethernet : ");
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X%c", mac[i], (i < 5) ? ':' : ' ');
-  }
-  Serial.println();
-
-  // 3. Connexion au réseau via DHCP
-  Serial.println("Connexion au réseau via DHCP...");
-  if (Ethernet.begin(mac) == 0) {
-    Serial.println("ERREUR : Pas de DHCP (Verifie le cable)");
-    // On peut tenter une IP fixe ici si le DHCP échoue
-  } else {
-    Serial.print("REUSSI ! IP : ");
-    Serial.println(Ethernet.localIP());
-  }
+  Serial.print("Connexion Ethernet... MAC: ");
+  for(int i=0; i<6; i++) Serial.printf("%02X ", mac[i]);
   
+  if (Ethernet.begin(mac) == 0) Serial.println("\nEchec DHCP");
+  else Serial.println(Ethernet.localIP());
+
   mqttClient.setServer(server, 1883);
   mqttClient.setCallback(callback);
   ScannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX_PIN, SCANNER_TX_PIN);
   attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, FALLING);
-  
-  Serial.println("=== Système PRÊT (Mode Filaire) ===");
 }
 
-// ================= BOUCLE PRINCIPALE =================
+// ================= LOOP =================
 void loop() {
-  // ADAPTÉ POUR ETHERNET : Pas de WiFi.status()
-  // On vérifie seulement la connexion au Broker MQTT
   if (!mqttClient.connected()) {
-    static unsigned long lastReconnectAttempt = 0;
-    if (millis() - lastReconnectAttempt > 5000) {
-      lastReconnectAttempt = millis();
-      Serial.print("Connexion MQTT... ");
-      if (mqttClient.connect("ESP32_Etudiant2")) {
-        mqttClient.subscribe("borne/reponse");
-        Serial.println("OK");
-      } else {
-        Serial.print("ECHEC, rc=");
-        Serial.println(mqttClient.state());
-      }
-    }
+    if (mqttClient.connect("ESP32_Etudiant2")) mqttClient.subscribe("borne/reponse");
   }
-  
   mqttClient.loop();
   actualiserLeds();
 
-  // ===== Vérification Bac Plein =====
+  // 1. Surveillance périodique Bac Plein avec SRF02
   static unsigned long lastCheckBac = 0;
   if (millis() - lastCheckBac > 2000) {
-    digitalWrite(TRIGGER_PIN, LOW); delayMicroseconds(2);
-    digitalWrite(TRIGGER_PIN, HIGH); delayMicroseconds(10);
-    digitalWrite(TRIGGER_PIN, LOW);
-    long dist = (pulseIn(ECHO_PIN, HIGH, 20000) * 0.034) / 2;
-    
+    int dist = lireSRF02();
     if (dist > 0 && dist < 10) {
       portENTER_CRITICAL(&myMux);
       currentState = BAC_PLEIN;
-      portEXIT_CRITICAL(&myMux);
-    } 
-    else if (dist >= 10 && currentState == BAC_PLEIN) {
-      portENTER_CRITICAL(&myMux);
-      currentState = BORNE_PRETE;
       portEXIT_CRITICAL(&myMux);
     }
     lastCheckBac = millis();
   }
 
-  // ===== Machine à états =====
+  // 2. Machine à états
   State etatActuel;
   portENTER_CRITICAL(&myMux);
   etatActuel = currentState;
   portEXIT_CRITICAL(&myMux);
   
   switch (etatActuel) {
-    
     case BORNE_PRETE:
       portENTER_CRITICAL(&myMux);
       if (interruptionEntree) {
         interruptionEntree = false;
         currentState = BOUTEILLE_DETECTEE;
         timerEtat = millis();
-        scanner_actif = true;
         while(ScannerSerial.available()) ScannerSerial.read();
       }
       portEXIT_CRITICAL(&myMux);
       break;
 
     case BOUTEILLE_DETECTEE:
-      if (millis() - timerEtat > 3000) {
+      if (millis() - timerEtat > 3000) { // Timeout CDC
         portENTER_CRITICAL(&myMux);
-        currentState = DEPOT_REFUSE;
-        timerEtat = millis();
-        scanner_actif = false;
+        currentState = DEPOT_REFUSE; timerEtat = millis();
         portEXIT_CRITICAL(&myMux);
         piloterMoteur(-1);
       } 
-      else if (scanner_actif && ScannerSerial.available()) {
+      else if (ScannerSerial.available()) {
         String code = ScannerSerial.readStringUntil('\r');
         code.trim();
         if (code.length() > 5) {
           mqttClient.publish("borne/scan", code.c_str());
           portENTER_CRITICAL(&myMux);
-          currentState = SCAN_EN_COURS;
-          timerEtat = millis();
-          scanner_actif = false;
+          currentState = SCAN_EN_COURS; timerEtat = millis();
           portEXIT_CRITICAL(&myMux);
         }
       }
       break;
 
     case SCAN_EN_COURS:
-      if (millis() - timerEtat > 5000) {
+      if (millis() - timerEtat > 5000) { // Timeout RPi
         portENTER_CRITICAL(&myMux);
-        currentState = DEPOT_REFUSE;
-        timerEtat = millis();
+        currentState = DEPOT_REFUSE; timerEtat = millis();
         portEXIT_CRITICAL(&myMux);
         piloterMoteur(-1);
       }
       break;
 
     case DEPOT_VALIDE:
-      if (!validation1_detectee && digitalRead(PIN_IR_VALIDATION_1) == LOW) {
-        validation1_detectee = true;
-      }
-      if (validation1_detectee && !validation2_detectee && digitalRead(PIN_IR_VALIDATION_2) == LOW) {
-        validation2_detectee = true;
-      }
+      // Validation par double capteur IR (CDC Page 6)
+      if (!v1_ok && digitalRead(PIN_IR_VALIDATION_1) == LOW) v1_ok = true;
+      if (v1_ok && !v2_ok && digitalRead(PIN_IR_VALIDATION_2) == LOW) v2_ok = true;
       
-      if (validation1_detectee && validation2_detectee && !bouteille_validee) {
+      if (v1_ok && v2_ok && !bouteille_validee) {
         bouteille_validee = true;
         mqttClient.publish("borne/validation", "OK");
       }
       
-      if (millis() - timerEtat > 3000) {
+      if (millis() - timerEtat > 4000) { // Temps de convoyage
         piloterMoteur(0);
         portENTER_CRITICAL(&myMux);
-        if (bouteille_validee) {
-          currentState = BORNE_PRETE;
-        } else {
-          currentState = DEPOT_REFUSE;
-          timerEtat = millis();
-          piloterMoteur(-1);
-        }
-        validation1_detectee = false; validation2_detectee = false; bouteille_validee = false;
+        currentState = bouteille_validee ? BORNE_PRETE : DEPOT_REFUSE;
+        if (currentState == DEPOT_REFUSE) { timerEtat = millis(); piloterMoteur(-1); }
         portEXIT_CRITICAL(&myMux);
       }
       break;
 
     case DEPOT_REFUSE:
-      if (millis() - timerEtat > 3000) {
+      if (millis() - timerEtat > 3000) { // Retour client 3s
         piloterMoteur(0);
         portENTER_CRITICAL(&myMux);
         currentState = BORNE_PRETE;
