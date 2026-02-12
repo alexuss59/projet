@@ -1,7 +1,7 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <FastLED.h>
-#include <Wire.h>       
+#include <Wire.h>
 #include "esp_system.h"
 
 // ================= CONFIGURATION MATÉRIELLE =================
@@ -22,8 +22,8 @@
 #define PIN_IR_VALIDATION_2 3
 
 // Pilotage Moteur
-#define MOTEUR_DIR1 20 //jaune
-#define MOTEUR_DIR2 21 //vert
+#define MOTEUR_DIR1 20 // jaune
+#define MOTEUR_DIR2 21 // vert
 
 // Commande HEX pour déclencher le scan
 const byte COMMAND_TRIGGER[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
@@ -37,12 +37,12 @@ volatile bool interruptionEntree = false;
 
 enum State
 {
-  BORNE_PRETE,        
-  BOUTEILLE_DETECTEE, 
-  SCAN_EN_COURS,      
-  DEPOT_VALIDE,       
-  DEPOT_REFUSE,       
-  BAC_PLEIN           
+  BORNE_PRETE,
+  BOUTEILLE_DETECTEE,
+  SCAN_EN_COURS,
+  DEPOT_VALIDE,
+  DEPOT_REFUSE,
+  BAC_PLEIN
 };
 
 volatile State currentState = BORNE_PRETE;
@@ -76,22 +76,22 @@ int lireSRF02()
 
 // ================= FONCTIONS MOTEUR =================
 void piloterMoteur(int sens)
-{ 
+{
   Serial.print(">>> MOTEUR: ");
-  
-  if (sens == 1)  // AVANT
+
+  if (sens == 1) // AVANT
   {
     digitalWrite(MOTEUR_DIR1, HIGH);
     digitalWrite(MOTEUR_DIR2, LOW);
     Serial.println("AVANT (DIR1=HIGH, DIR2=LOW)");
   }
-  else if (sens == -1)  // ARRIÈRE
+  else if (sens == -1) // ARRIÈRE
   {
     digitalWrite(MOTEUR_DIR1, LOW);
     digitalWrite(MOTEUR_DIR2, HIGH);
     Serial.println("ARRIERE (DIR1=LOW, DIR2=HIGH)");
   }
-  else  // STOP
+  else // STOP
   {
     digitalWrite(MOTEUR_DIR1, LOW);
     digitalWrite(MOTEUR_DIR2, LOW);
@@ -172,7 +172,7 @@ void setup()
 
   ScannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX_PIN, SCANNER_TX_PIN);
   attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, FALLING);
-  
+
   Serial.println("=== SYSTÈME DÉMARRÉ (MODE TEST SANS MQTT) ===");
   Serial.println("Tous les codes seront acceptés automatiquement");
 }
@@ -213,29 +213,26 @@ void loop()
       timerEtat = millis();
       while (ScannerSerial.available())
         ScannerSerial.read();
-      Serial.println("\n>>> BOUTEILLE DÉTECTÉE");
+      Serial.println("\n>>> BOUTEILLE DÉTECTÉE (Faisceau coupé)");
     }
     portEXIT_CRITICAL(&myMux);
     break;
 
   case BOUTEILLE_DETECTEE:
+    // Ici on utilise static, donc pas besoin d'accolades, mais on pourrait en mettre
     static bool commandeEnvoyee = false;
 
     if (!commandeEnvoyee)
     {
       while (ScannerSerial.available())
         ScannerSerial.read();
-
-      Serial.println(">>> Envoi commande SCAN...");
       ScannerSerial.write(0x00);
       delay(50);
       ScannerSerial.write(COMMAND_TRIGGER, sizeof(COMMAND_TRIGGER));
-
       commandeEnvoyee = true;
       timerEtat = millis();
     }
 
-    // Timeout 3 secondes
     if (millis() - timerEtat > 3000)
     {
       Serial.println(">>> TIMEOUT - Aucun code scanné");
@@ -246,7 +243,6 @@ void loop()
       commandeEnvoyee = false;
       piloterMoteur(-1);
     }
-    // Lecture du code-barre
     else if (ScannerSerial.available())
     {
       String codeBrut = ScannerSerial.readStringUntil('\r');
@@ -254,32 +250,26 @@ void loop()
 
       if (codePropre.length() > 10)
       {
-        Serial.print(">>> CODE SCANNÉ : ");
+        Serial.print(">>> CODE LU : ");
         Serial.println(codePropre);
-        
-        // ✅ ON ACCEPTE TOUS LES CODES (MODE TEST)
-        Serial.println(">>> ✅ CODE ACCEPTÉ (mode test)");
-        Serial.println(">>> DÉMARRAGE MOTEUR AVANT");
-        
+        Serial.println(">>> ✅ MODE TEST : CODE ACCEPTÉ D'OFFICE");
+
         portENTER_CRITICAL(&myMux);
         currentState = DEPOT_VALIDE;
         timerEtat = millis();
-        v1_ok = false;
-        v2_ok = false;
         bouteille_validee = false;
         portEXIT_CRITICAL(&myMux);
-        
-        piloterMoteur(1); // ← LE MOTEUR DÉMARRE ICI
-        
+
+        piloterMoteur(1);
         commandeEnvoyee = false;
       }
     }
     break;
 
   case DEPOT_VALIDE:
-    // =========================================================
-    // LOGIQUE ANTI-FRAUDE (CHECKPOINTS)
-    // =========================================================
+  { // <--- ACCOLADE DÉBUT (C'est elle qui corrige ton erreur !)
+
+    // Variables locales isolées grâce aux accolades
     byte ir1 = digitalRead(PIN_IR_VALIDATION_1);
     byte ir2 = digitalRead(PIN_IR_VALIDATION_2);
     int etatBinaire = (ir1 << 1) | ir2;
@@ -289,63 +279,72 @@ void loop()
     static bool fraudeDetectee = false;
 
     // 1. Entrée (01 ou 00)
-    if (etatBinaire == 1 || etatBinaire == 0) {
+    if (etatBinaire == 1 || etatBinaire == 0)
+    {
       aVuEntree = true;
-      if (aVuSortie == true) { // Si on revient en arrière après avoir vu la sortie
+      if (aVuSortie == true)
+      {
         fraudeDetectee = true;
         Serial.println(">>> ALERTE : Retour arrière !");
       }
     }
 
     // 2. Sortie imminente (10)
-    if (etatBinaire == 2) {
-      if (aVuEntree) aVuSortie = true;
+    if (etatBinaire == 2)
+    {
+      if (aVuEntree)
+        aVuSortie = true;
     }
 
-    // 3. Disparition (11) - Verdict
-    if (etatBinaire == 3) { 
-      // SUCCÈS
-      if (aVuEntree && aVuSortie && !fraudeDetectee && !bouteille_validee) {
+    // 3. Verdict (11)
+    if (etatBinaire == 3)
+    {
+      if (aVuEntree && aVuSortie && !fraudeDetectee && !bouteille_validee)
+      {
         bouteille_validee = true;
         Serial.println(">>> SÉQUENCE VALIDE (01->00->10->11) ✅");
-        
-        delay(500); 
+        delay(500);
         piloterMoteur(0);
-        
         portENTER_CRITICAL(&myMux);
         currentState = BORNE_PRETE;
         portEXIT_CRITICAL(&myMux);
-        
-        aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
+        aVuEntree = false;
+        aVuSortie = false;
+        fraudeDetectee = false;
       }
-      // ECHEC / FRAUDE
-      else if (aVuEntree && (!aVuSortie || fraudeDetectee)) {
+      else if (aVuEntree && (!aVuSortie || fraudeDetectee))
+      {
         Serial.println(">>> REFUS : Séquence incorrecte ⛔");
         piloterMoteur(0);
-        
         portENTER_CRITICAL(&myMux);
         currentState = DEPOT_REFUSE;
         timerEtat = millis();
         portEXIT_CRITICAL(&myMux);
-        
-        piloterMoteur(-1); // Rejet
-        aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
+        piloterMoteur(-1);
+        aVuEntree = false;
+        aVuSortie = false;
+        fraudeDetectee = false;
       }
     }
 
-    if (millis() - timerEtat > 5000) {
-       Serial.println(">>> TIMEOUT GLOBAL");
-       piloterMoteur(0);
-       portENTER_CRITICAL(&myMux);
-       currentState = DEPOT_REFUSE;
-       timerEtat = millis();
-       portEXIT_CRITICAL(&myMux);
-       piloterMoteur(-1);
-       aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
+    if (millis() - timerEtat > 15000)
+    {
+      Serial.println(">>> TIMEOUT GLOBAL");
+      piloterMoteur(0);
+      portENTER_CRITICAL(&myMux);
+      currentState = DEPOT_REFUSE;
+      timerEtat = millis();
+      portEXIT_CRITICAL(&myMux);
+      piloterMoteur(-1);
+      aVuEntree = false;
+      aVuSortie = false;
+      fraudeDetectee = false;
     }
-    break;
 
-  case DEPOT_REFUSE:
+  } // <--- ACCOLADE FIN (Indispensable !)
+  break;
+
+  case DEPOT_REFUSE: // Le compilateur ne râlera plus ici
     if (millis() - timerEtat > 3000)
     {
       Serial.println(">>> Fin du rejet (3s)");
