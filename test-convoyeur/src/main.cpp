@@ -1,13 +1,11 @@
-
 #include <SPI.h>
 #include <Ethernet.h>
 #include <FastLED.h>
-#include <PubSubClient.h>
-#include <Wire.h>       // Pour le capteur SRF02 (I2C)
-#include "esp_system.h" // Pour la lecture de la MAC d'usine
+#include <Wire.h>       
+#include "esp_system.h"
 
 // ================= CONFIGURATION MATÉRIELLE =================
-#define W5500_CS_PIN 10 // Pin CS Ethernet
+#define W5500_CS_PIN 10
 #define LED_PIN 7
 #define NUM_LEDS 27
 #define SCANNER_RX_PIN 17
@@ -24,10 +22,10 @@
 #define PIN_IR_VALIDATION_2 3
 
 // Pilotage Moteur
-#define MOTEUR_DIR1 20
-#define MOTEUR_DIR2 21
+#define MOTEUR_DIR1 20 //jaune
+#define MOTEUR_DIR2 21 //vert
 
-// Commande HEX pour déclencher le scan (Manuel Page 25)
+// Commande HEX pour déclencher le scan
 const byte COMMAND_TRIGGER[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
 
 HardwareSerial ScannerSerial(2);
@@ -39,12 +37,12 @@ volatile bool interruptionEntree = false;
 
 enum State
 {
-  BORNE_PRETE,        // Vert fixe
-  BOUTEILLE_DETECTEE, // Bleu fixe
-  SCAN_EN_COURS,      // Bleu clignotant
-  DEPOT_VALIDE,       // Bleu clignotant
-  DEPOT_REFUSE,       // Rouge clignotant
-  BAC_PLEIN           // Rouge fixe
+  BORNE_PRETE,        
+  BOUTEILLE_DETECTEE, 
+  SCAN_EN_COURS,      
+  DEPOT_VALIDE,       
+  DEPOT_REFUSE,       
+  BAC_PLEIN           
 };
 
 volatile State currentState = BORNE_PRETE;
@@ -53,24 +51,15 @@ bool clignotementState = false;
 
 bool v1_ok = false, v2_ok = false, bouteille_validee = false;
 
-// ================= RÉSEAU & MQTT =================
-IPAddress server(192, 168, 1, 100); // Raspberry Pi 5
-EthernetClient ethClient;
-PubSubClient mqttClient(ethClient);
-
 // ================= FONCTION SRF02 (I2C) =================
 int lireSRF02()
 {
-  // 1. Lancement de la mesure en cm (commande 0x51)
   Wire.beginTransmission(SRF02_ADDR);
   Wire.write(0x00);
   Wire.write(0x51);
   Wire.endTransmission();
-
-  // 2. Le SRF02 a besoin de 70ms pour mesurer
   delay(70);
 
-  // 3. Lecture du résultat (registres 2 et 3)
   Wire.beginTransmission(SRF02_ADDR);
   Wire.write(0x02);
   Wire.endTransmission();
@@ -87,28 +76,26 @@ int lireSRF02()
 
 // ================= FONCTIONS MOTEUR =================
 void piloterMoteur(int sens)
-{ // 1:Avant, -1:Arrière, 0:Stop
-  
-  Serial.print(">>> MOTEUR commande: ");
-  Serial.println(sens);
+{ 
+  Serial.print(">>> MOTEUR: ");
   
   if (sens == 1)  // AVANT
   {
     digitalWrite(MOTEUR_DIR1, HIGH);
     digitalWrite(MOTEUR_DIR2, LOW);
-    Serial.println("    DIR1=HIGH, DIR2=LOW");
+    Serial.println("AVANT (DIR1=HIGH, DIR2=LOW)");
   }
   else if (sens == -1)  // ARRIÈRE
   {
     digitalWrite(MOTEUR_DIR1, LOW);
     digitalWrite(MOTEUR_DIR2, HIGH);
-    Serial.println("    DIR1=LOW, DIR2=HIGH");
+    Serial.println("ARRIERE (DIR1=LOW, DIR2=HIGH)");
   }
   else  // STOP
   {
     digitalWrite(MOTEUR_DIR1, LOW);
     digitalWrite(MOTEUR_DIR2, LOW);
-    Serial.println("    DIR1=LOW, DIR2=LOW (STOP)");
+    Serial.println("STOP (DIR1=LOW, DIR2=LOW)");
   }
 }
 
@@ -149,39 +136,6 @@ void actualiserLeds()
   FastLED.show();
 }
 
-// ================= LOGIQUE MQTT =================
-void callback(char *topic, byte *payload, unsigned int length)
-{
-  String msg = "";
-  for (int i = 0; i < length; i++)
-    msg += (char)payload[i];
-
-  Serial.print(">>> MQTT topic: ");
-  Serial.print(topic);
-  Serial.print(" | message: ");
-  Serial.println(msg);
-
-  portENTER_CRITICAL(&myMux);
-  if (msg == "OK")
-  {
-    Serial.println(">>> CODE VALIDE - Lancement moteur AVANT");
-    currentState = DEPOT_VALIDE;
-    timerEtat = millis();
-    v1_ok = false;
-    v2_ok = false;
-    bouteille_validee = false;
-    piloterMoteur(1); // Marche avant
-  }
-  else
-  {
-    Serial.println(">>> CODE REFUSE - Lancement moteur ARRIERE");
-    currentState = DEPOT_REFUSE;
-    timerEtat = millis();
-    piloterMoteur(-1); // Marche arrière
-  }
-  portEXIT_CRITICAL(&myMux);
-}
-
 // ================= INTERRUPTION =================
 void IRAM_ATTR ISR_Entree()
 {
@@ -197,9 +151,7 @@ String nettoyerCode(String brut)
   for (int i = 0; i < brut.length(); i++)
   {
     if (isDigit(brut[i]))
-    { // Si c'est un chiffre (0-9)
       propre += brut[i];
-    }
   }
   return propre;
 }
@@ -208,7 +160,7 @@ String nettoyerCode(String brut)
 void setup()
 {
   Serial.begin(115200);
-  Wire.begin(SDA_PIN_sfr02, SCL_PIN_sfr02); // Initialisation I2C pour SRF02
+  Wire.begin(SDA_PIN_sfr02, SCL_PIN_sfr02);
 
   pinMode(MOTEUR_DIR1, OUTPUT);
   pinMode(MOTEUR_DIR2, OUTPUT);
@@ -218,39 +170,19 @@ void setup()
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
 
-  // Ethernet & MAC
-  Ethernet.init(W5500_CS_PIN);
-  byte mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  mac[5] += 1; // MAC Ethernet unique
-
-  Serial.print("Connexion Ethernet... MAC: ");
-  for (int i = 0; i < 6; i++)
-    Serial.printf("%02X ", mac[i]);
-
-  if (Ethernet.begin(mac) == 0)
-    Serial.println("\nEchec DHCP");
-  else
-    Serial.println(Ethernet.localIP());
-
-  mqttClient.setServer(server, 1883);
-  mqttClient.setCallback(callback);
   ScannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX_PIN, SCANNER_TX_PIN);
-  attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, RISING);
+  
+  Serial.println("=== SYSTÈME DÉMARRÉ (MODE TEST SANS MQTT) ===");
+  Serial.println("Tous les codes seront acceptés automatiquement");
 }
 
 // ================= LOOP =================
 void loop()
 {
-  if (!mqttClient.connected())
-  {
-    if (mqttClient.connect("ESP32_Etudiant2"))
-      mqttClient.subscribe("borne/reponse");
-  }
-  mqttClient.loop();
   actualiserLeds();
 
-  // 1. Surveillance périodique Bac Plein avec SRF02
+  // Surveillance Bac Plein
   static unsigned long lastCheckBac = 0;
   if (millis() - lastCheckBac > 2000)
   {
@@ -264,7 +196,7 @@ void loop()
     lastCheckBac = millis();
   }
 
-  // 2. Machine à états
+  // Machine à états
   State etatActuel;
   portENTER_CRITICAL(&myMux);
   etatActuel = currentState;
@@ -281,101 +213,93 @@ void loop()
       timerEtat = millis();
       while (ScannerSerial.available())
         ScannerSerial.read();
+      Serial.println("\n>>> BOUTEILLE DÉTECTÉE");
     }
     portEXIT_CRITICAL(&myMux);
     break;
 
   case BOUTEILLE_DETECTEE:
-    static bool commandeEnvoyee = false; // Mémoire pour ne pas spammer la commande
+    static bool commandeEnvoyee = false;
 
-    // 1. Envoi de la commande de scan (UNE SEULE FOIS)
     if (!commandeEnvoyee)
     {
-      // Vidage du tampon
       while (ScannerSerial.available())
         ScannerSerial.read();
 
-      Serial.println(">>> REVEIL");
-
-      // 1. On envoie un octet nul pour réveiller le module
+      Serial.println(">>> Envoi commande SCAN...");
       ScannerSerial.write(0x00);
-      delay(50); // On lui laisse 50ms
-
-      // 2. On envoie la vraie commande
+      delay(50);
       ScannerSerial.write(COMMAND_TRIGGER, sizeof(COMMAND_TRIGGER));
 
       commandeEnvoyee = true;
       timerEtat = millis();
     }
 
-    // 2. Gestion du Timeout (3 secondes)
+    // Timeout 3 secondes
     if (millis() - timerEtat > 3000)
     {
-      Serial.println(">>> Timeout (3s) ! Aucune bouteille lue.");
-
+      Serial.println(">>> TIMEOUT - Aucun code scanné");
       portENTER_CRITICAL(&myMux);
       currentState = DEPOT_REFUSE;
       timerEtat = millis();
       portEXIT_CRITICAL(&myMux);
-
-      commandeEnvoyee = false; // Reset pour la prochaine fois
-      piloterMoteur(-1);       // Rejet
+      commandeEnvoyee = false;
+      piloterMoteur(-1);
     }
-
-    // 3. Lecture du résultat
+    // Lecture du code-barre
     else if (ScannerSerial.available())
     {
       String codeBrut = ScannerSerial.readStringUntil('\r');
-
-      // On nettoie le code reçu
       String codePropre = nettoyerCode(codeBrut);
 
-      // Un code EAN-13 fait 13 chiffres (parfois le scanner ajoute un préfixe, d'où > 10)
       if (codePropre.length() > 10)
       {
-        Serial.print(">>> Code NETTOYÉ : ");
+        Serial.print(">>> CODE SCANNÉ : ");
         Serial.println(codePropre);
-
-        // Envoi au MQTT du code propre uniquement
-        mqttClient.publish("borne/scan", codePropre.c_str());
-
+        
+        // ✅ ON ACCEPTE TOUS LES CODES (MODE TEST)
+        Serial.println(">>> ✅ CODE ACCEPTÉ (mode test)");
+        Serial.println(">>> DÉMARRAGE MOTEUR AVANT");
+        
         portENTER_CRITICAL(&myMux);
-        currentState = SCAN_EN_COURS;
+        currentState = DEPOT_VALIDE;
         timerEtat = millis();
+        v1_ok = false;
+        v2_ok = false;
+        bouteille_validee = false;
         portEXIT_CRITICAL(&myMux);
-
+        
+        piloterMoteur(1); // ← LE MOTEUR DÉMARRE ICI
+        
         commandeEnvoyee = false;
       }
     }
     break;
 
-  case SCAN_EN_COURS:
-    if (millis() - timerEtat > 5000)
-    { // Timeout RPi
-      portENTER_CRITICAL(&myMux);
-      currentState = DEPOT_REFUSE;
-      timerEtat = millis();
-      portEXIT_CRITICAL(&myMux);
-      piloterMoteur(-1);
-    }
-    break;
-
   case DEPOT_VALIDE:
-    // Validation par double capteur IR (CDC Page 6)
-    if (!v1_ok && digitalRead(PIN_IR_VALIDATION_1) == LOW)
+    // Validation par double capteur IR
+    if (!v1_ok && digitalRead(PIN_IR_VALIDATION_1) == HIGH)
+    {
       v1_ok = true;
-    if (v1_ok && !v2_ok && digitalRead(PIN_IR_VALIDATION_2) == LOW)
+      Serial.println(">>> Capteur IR1 activé");
+    }
+    if (v1_ok && !v2_ok && digitalRead(PIN_IR_VALIDATION_2) == HIGH)
+    {
       v2_ok = true;
+      Serial.println(">>> Capteur IR2 activé");
+    }
 
     if (v1_ok && v2_ok && !bouteille_validee)
     {
       bouteille_validee = true;
-      mqttClient.publish("borne/validation", "OK");
+      Serial.println(">>> ✅ BOUTEILLE VALIDÉE");
     }
 
     if (millis() - timerEtat > 4000)
-    { // Temps de convoyage
+    {
+      Serial.println(">>> Fin du convoyage (4s)");
       piloterMoteur(0);
+      
       portENTER_CRITICAL(&myMux);
       currentState = bouteille_validee ? BORNE_PRETE : DEPOT_REFUSE;
       if (currentState == DEPOT_REFUSE)
@@ -389,10 +313,12 @@ void loop()
 
   case DEPOT_REFUSE:
     if (millis() - timerEtat > 3000)
-    { // Retour client 3s
+    {
+      Serial.println(">>> Fin du rejet (3s)");
       piloterMoteur(0);
       portENTER_CRITICAL(&myMux);
       currentState = BORNE_PRETE;
+      Serial.println(">>> Borne prête");
       portEXIT_CRITICAL(&myMux);
     }
     break;
