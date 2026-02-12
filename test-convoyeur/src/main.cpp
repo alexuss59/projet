@@ -171,7 +171,7 @@ void setup()
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
 
   ScannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX_PIN, SCANNER_TX_PIN);
-  attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, FALLING);
   
   Serial.println("=== SYSTÈME DÉMARRÉ (MODE TEST SANS MQTT) ===");
   Serial.println("Tous les codes seront acceptés automatiquement");
@@ -277,37 +277,71 @@ void loop()
     break;
 
   case DEPOT_VALIDE:
-    // Validation par double capteur IR
-    if (!v1_ok && digitalRead(PIN_IR_VALIDATION_1) == HIGH)
-    {
-      v1_ok = true;
-      Serial.println(">>> Capteur IR1 activé");
-    }
-    if (v1_ok && !v2_ok && digitalRead(PIN_IR_VALIDATION_2) == HIGH)
-    {
-      v2_ok = true;
-      Serial.println(">>> Capteur IR2 activé");
-    }
+    // =========================================================
+    // LOGIQUE ANTI-FRAUDE (CHECKPOINTS)
+    // =========================================================
+    byte ir1 = digitalRead(PIN_IR_VALIDATION_1);
+    byte ir2 = digitalRead(PIN_IR_VALIDATION_2);
+    int etatBinaire = (ir1 << 1) | ir2;
 
-    if (v1_ok && v2_ok && !bouteille_validee)
-    {
-      bouteille_validee = true;
-      Serial.println(">>> ✅ BOUTEILLE VALIDÉE");
-    }
+    static bool aVuEntree = false;
+    static bool aVuSortie = false;
+    static bool fraudeDetectee = false;
 
-    if (millis() - timerEtat > 4000)
-    {
-      Serial.println(">>> Fin du convoyage (4s)");
-      piloterMoteur(0);
-      
-      portENTER_CRITICAL(&myMux);
-      currentState = bouteille_validee ? BORNE_PRETE : DEPOT_REFUSE;
-      if (currentState == DEPOT_REFUSE)
-      {
-        timerEtat = millis();
-        piloterMoteur(-1);
+    // 1. Entrée (01 ou 00)
+    if (etatBinaire == 1 || etatBinaire == 0) {
+      aVuEntree = true;
+      if (aVuSortie == true) { // Si on revient en arrière après avoir vu la sortie
+        fraudeDetectee = true;
+        Serial.println(">>> ALERTE : Retour arrière !");
       }
-      portEXIT_CRITICAL(&myMux);
+    }
+
+    // 2. Sortie imminente (10)
+    if (etatBinaire == 2) {
+      if (aVuEntree) aVuSortie = true;
+    }
+
+    // 3. Disparition (11) - Verdict
+    if (etatBinaire == 3) { 
+      // SUCCÈS
+      if (aVuEntree && aVuSortie && !fraudeDetectee && !bouteille_validee) {
+        bouteille_validee = true;
+        Serial.println(">>> SÉQUENCE VALIDE (01->00->10->11) ✅");
+        
+        delay(500); 
+        piloterMoteur(0);
+        
+        portENTER_CRITICAL(&myMux);
+        currentState = BORNE_PRETE;
+        portEXIT_CRITICAL(&myMux);
+        
+        aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
+      }
+      // ECHEC / FRAUDE
+      else if (aVuEntree && (!aVuSortie || fraudeDetectee)) {
+        Serial.println(">>> REFUS : Séquence incorrecte ⛔");
+        piloterMoteur(0);
+        
+        portENTER_CRITICAL(&myMux);
+        currentState = DEPOT_REFUSE;
+        timerEtat = millis();
+        portEXIT_CRITICAL(&myMux);
+        
+        piloterMoteur(-1); // Rejet
+        aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
+      }
+    }
+
+    if (millis() - timerEtat > 5000) {
+       Serial.println(">>> TIMEOUT GLOBAL");
+       piloterMoteur(0);
+       portENTER_CRITICAL(&myMux);
+       currentState = DEPOT_REFUSE;
+       timerEtat = millis();
+       portEXIT_CRITICAL(&myMux);
+       piloterMoteur(-1);
+       aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
     }
     break;
 
