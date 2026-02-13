@@ -4,56 +4,43 @@
 #include <Wire.h>
 #include "esp_system.h"
 
-// =============================================================
-//                   CONFIGURATION MATÉRIELLE
-// =============================================================
-
-// --- ETHERNET (Non utilisé pour l'instant) ---
-#define W5500_CS_PIN 10
-
-// --- LED STRIP ---
+// ================= CONFIGURATION MATÉRIELLE =================
 #define LED_PIN 7
 #define NUM_LEDS 27
-
-// --- SCANNER BARCODE (UART2) ---
 #define SCANNER_RX_PIN 17
 #define SCANNER_TX_PIN 18
 
-// --- CAPTEUR ULTRASON (I2C) ---
+// I2C & Capteurs
 #define SRF02_ADDR 0x70
 #define SDA_PIN_sfr02 8
 #define SCL_PIN_sfr02 9
-
-// --- CAPTEURS IR (Logique Inversée gérée dans le code) ---
 #define PIN_IR_ENTREE 6
 #define PIN_IR_VALIDATION_1 2
 #define PIN_IR_VALIDATION_2 3
 
-// --- MOTEUR (Pont en H) ---
-#define MOTEUR_DIR1 20 // Fil Jaune
-#define MOTEUR_DIR2 21 // Fil Vert
+// Moteur
+#define MOTEUR_DIR1 20 
+#define MOTEUR_DIR2 21 
 
-// Commande HEX pour déclencher le scan (Trigger)
 const byte COMMAND_TRIGGER[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
 
-// Objets Globaux
 HardwareSerial ScannerSerial(2);
 CRGB leds[NUM_LEDS];
 
-// =============================================================
-//                   VARIABLES GLOBALES
-// =============================================================
-
+// ================= VARIABLES SYSTÈME =================
 portMUX_TYPE myMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool interruptionEntree = false;
 
+// --- NOUVEAUX ÉTATS POUR LE NON-BLOQUANT ---
 enum State
 {
   BORNE_PRETE,
   BOUTEILLE_DETECTEE,
-  SCAN_EN_COURS,
-  DEPOT_VALIDE,
-  DEPOT_REFUSE,
+  SCAN_EN_COURS,     // (Optionnel si tu veux séparer)
+  DEPOT_VALIDE,      // La bouteille avance et on vérifie les capteurs
+  ATTENTE_CHUTE,     // (Nouveau) 500ms pour laisser tomber la bouteille
+  ATTENTE_REJET,     // (Nouveau) 1s de pause rouge avant marche arrière
+  REJET_EN_COURS,    // (Renommé) La marche arrière de 10s
   BAC_PLEIN
 };
 
@@ -61,25 +48,21 @@ volatile State currentState = BORNE_PRETE;
 unsigned long timerEtat = 0;
 bool clignotementState = false;
 
-// --- VARIABLES DE SUIVI (TRACKING) ---
-// Déclarées en global pour pouvoir être remises à zéro n'importe quand
+// Variables de suivi
 bool v1_ok = false, v2_ok = false, bouteille_validee = false;
-bool aVuEntree = false;
-bool aVuSortie = false;
-bool fraudeDetectee = false;
+bool aVuEntree = false, aVuSortie = false, fraudeDetectee = false;
 
-// =============================================================
-//                   FONCTIONS UTILITAIRES
-// =============================================================
+// ================= FONCTIONS UTILITAIRES =================
 
-// --- LECTURE ULTRASON SRF02 ---
 int lireSRF02()
 {
   Wire.beginTransmission(SRF02_ADDR);
   Wire.write(0x00);
-  Wire.write(0x51); // Commande mesure en cm
+  Wire.write(0x51);
   Wire.endTransmission();
-  delay(70);
+  // Note : Ce delay(70) est le SEUL bloquant restant (requis par le capteur I2C)
+  // On pourrait l'enlever avec une gestion complexe, mais c'est acceptable ici.
+  delay(70); 
 
   Wire.beginTransmission(SRF02_ADDR);
   Wire.write(0x02);
@@ -95,38 +78,13 @@ int lireSRF02()
   return -1;
 }
 
-// ================= FONCTIONS MOTEUR (INTELLIGENTE) =================
+// --- PILOTAGE MOTEUR (SIMPLIFIÉ & INSTANTANÉ) ---
+// Plus aucun delay() ici ! C'est la machine à états qui gère le timing.
 void piloterMoteur(int sens)
 {
-  // Variable "mémoire" qui reste stockée entre deux appels
-  static int dernierSens = 99; // 99 = valeur impossible au démarrage
-
-  // Si on demande la MÊME chose que la dernière fois, on ne fait RIEN.
-  // C'est ça qui empêche les à-coups !
-  if (sens == dernierSens) return;
-
-  // ---------------------------------------------------------
-  // Si on arrive ici, c'est que le sens A CHANGÉ.
-  // On applique donc la procédure de sécurité.
-  // ---------------------------------------------------------
-
-  // 1. On mémorise le nouveau sens
-  dernierSens = sens;
-
-  // 2. On coupe tout
-  digitalWrite(MOTEUR_DIR1, LOW);
-  digitalWrite(MOTEUR_DIR2, LOW);
-
-  // 3. Temps mort (seulement si on ne demande pas l'arrêt total)
-  if (sens != 0) 
-  {
-    delay(500); // Pause de sécurité mécanique
-  }
-
-  Serial.print(">>> CHANGEMENT MOTEUR VERS : ");
-  Serial.println(sens);
-
-  // 4. On applique la nouvelle direction
+  // On applique simplement les tensions.
+  // La sécurité "Dead Time" est maintenant gérée par l'état ATTENTE_REJET
+  
   if (sens == 1) // AVANT
   {
     digitalWrite(MOTEUR_DIR1, HIGH);
@@ -137,14 +95,19 @@ void piloterMoteur(int sens)
     digitalWrite(MOTEUR_DIR1, LOW);
     digitalWrite(MOTEUR_DIR2, HIGH);
   }
-  // Si sens == 0, on laisse tout à LOW (déjà fait à l'étape 2)
+  else // STOP
+  {
+    digitalWrite(MOTEUR_DIR1, LOW);
+    digitalWrite(MOTEUR_DIR2, LOW);
+  }
 }
 
-// --- GESTION DES LEDS ---
+// --- GESTION DES LEDS (ANIMATION FLUIDE) ---
 void actualiserLeds()
 {
   static unsigned long lastBlink = 0;
-  if (millis() - lastBlink > 400)
+  // Clignotement rapide (200ms) pour bien voir que ça vit
+  if (millis() - lastBlink > 200) 
   {
     clignotementState = !clignotementState;
     lastBlink = millis();
@@ -160,24 +123,36 @@ void actualiserLeds()
   case BORNE_PRETE:
     fill_solid(leds, NUM_LEDS, CRGB::Green);
     break;
+    
   case BOUTEILLE_DETECTEE:
     fill_solid(leds, NUM_LEDS, CRGB::Blue);
     break;
-  case SCAN_EN_COURS:
-  case DEPOT_VALIDE:
+    
+  case DEPOT_VALIDE: // Convoyage en cours
+    // Chenillard ou clignotement bleu
     fill_solid(leds, NUM_LEDS, clignotementState ? CRGB::Blue : CRGB::Black);
     break;
-  case DEPOT_REFUSE:
+    
+  case ATTENTE_CHUTE: // Succès imminent
+    fill_solid(leds, NUM_LEDS, CRGB::Green); // Vert fixe confirmant le succès
+    break;
+
+  case ATTENTE_REJET: // Pause dramatique
+    fill_solid(leds, NUM_LEDS, CRGB::Red); // Rouge FIXE et intense
+    break;
+    
+  case REJET_EN_COURS: // Marche arrière
+    // Rouge clignotant alerte
     fill_solid(leds, NUM_LEDS, clignotementState ? CRGB::Red : CRGB::Black);
     break;
+    
   case BAC_PLEIN:
-    fill_solid(leds, NUM_LEDS, CRGB::Red);
+    fill_solid(leds, NUM_LEDS, CRGB::Red); // Rouge permanent
     break;
   }
   FastLED.show();
 }
 
-// --- INTERRUPTION IR ENTREE ---
 void IRAM_ATTR ISR_Entree()
 {
   portENTER_CRITICAL_ISR(&myMux);
@@ -186,59 +161,45 @@ void IRAM_ATTR ISR_Entree()
   portEXIT_CRITICAL_ISR(&myMux);
 }
 
-// --- NETTOYAGE STRING ---
 String nettoyerCode(String brut)
 {
   String propre = "";
-  for (int i = 0; i < brut.length(); i++)
-  {
-    if (isDigit(brut[i]))
-      propre += brut[i];
+  for (int i = 0; i < brut.length(); i++) {
+    if (isDigit(brut[i])) propre += brut[i];
   }
   return propre;
 }
 
-// =============================================================
-//                         SETUP
-// =============================================================
+// ================= SETUP =================
 void setup()
 {
   Serial.begin(115200);
   Wire.begin(SDA_PIN_sfr02, SCL_PIN_sfr02);
 
-  // Config Pins
   pinMode(MOTEUR_DIR1, OUTPUT);
   pinMode(MOTEUR_DIR2, OUTPUT);
   pinMode(PIN_IR_ENTREE, INPUT_PULLUP);
   pinMode(PIN_IR_VALIDATION_1, INPUT_PULLUP);
   pinMode(PIN_IR_VALIDATION_2, INPUT_PULLUP);
 
-  // Init LEDs
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-
-  // Init Scanner
   ScannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX_PIN, SCANNER_TX_PIN);
-  
-  // Interruption Entrée (Sur front montant = coupure faisceau)
   attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, RISING);
 
-  Serial.println("=== SYSTÈME OPTIMISÉ (TIMEOUT 10s + REVERSE SECURISE) ===");
+  Serial.println("=== SYSTÈME DÉMARRÉ (NON-BLOQUANT) ===");
 }
 
-// =============================================================
-//                         LOOP
-// =============================================================
+// ================= LOOP =================
 void loop()
 {
+  // Cette fonction tourne à toute vitesse, permettant aux LEDS de s'animer
   actualiserLeds();
 
-  // ---------------------------------------------
-  // 1. SURVEILLANCE BAC PLEIN (Toutes les 2 sec)
-  // ---------------------------------------------
+  // Surveillance Bac (Toutes les 2 sec)
   static unsigned long lastCheckBac = 0;
   if (millis() - lastCheckBac > 2000)
   {
-    int dist = lireSRF02();
+    int dist = lireSRF02(); // Le seul mini-blocage (70ms) est ici
     if (dist > 0 && dist < 10)
     {
       portENTER_CRITICAL(&myMux);
@@ -248,9 +209,7 @@ void loop()
     lastCheckBac = millis();
   }
 
-  // ---------------------------------------------
-  // 2. MACHINE À ÉTATS
-  // ---------------------------------------------
+  // --- MACHINE À ÉTATS ---
   State etatActuel;
   portENTER_CRITICAL(&myMux);
   etatActuel = currentState;
@@ -258,50 +217,47 @@ void loop()
 
   switch (etatActuel)
   {
-  // --- ÉTAT 1 : ATTENTE ---
   case BORNE_PRETE:
+    piloterMoteur(0); // S'assure que le moteur est coupé
     portENTER_CRITICAL(&myMux);
     if (interruptionEntree)
     {
       interruptionEntree = false;
       currentState = BOUTEILLE_DETECTEE;
       timerEtat = millis();
-      // Vidage tampon scanner
       while (ScannerSerial.available()) ScannerSerial.read();
-      Serial.println("\n>>> BOUTEILLE DÉTECTÉE (Faisceau coupé)");
+      Serial.println("\n>>> BOUTEILLE DÉTECTÉE");
     }
     portEXIT_CRITICAL(&myMux);
     break;
 
-  // --- ÉTAT 2 : SCAN ---
   case BOUTEILLE_DETECTEE:
     static bool commandeEnvoyee = false;
 
-    // Envoi de la commande Trigger (une seule fois)
     if (!commandeEnvoyee)
     {
       while (ScannerSerial.available()) ScannerSerial.read();
-      ScannerSerial.write(0x00); // Réveil
-      delay(50);
+      ScannerSerial.write(0x00);
+      delay(10); // Petit délai négligeable pour le UART
       ScannerSerial.write(COMMAND_TRIGGER, sizeof(COMMAND_TRIGGER));
       commandeEnvoyee = true;
       timerEtat = millis();
     }
 
-    // Timeout Scan (3s) -> Si échec, on rejette
+    // Timeout Scan (3s)
     if (millis() - timerEtat > 3000)
     {
-      Serial.println(">>> TIMEOUT SCAN - Aucun code lu");
+      Serial.println(">>> TIMEOUT SCAN -> Rejet");
       
+      // Passage en mode ATTENTE REJET (Pause rouge)
       portENTER_CRITICAL(&myMux);
-      currentState = DEPOT_REFUSE;
+      currentState = ATTENTE_REJET;
       timerEtat = millis();
       portEXIT_CRITICAL(&myMux);
       
       commandeEnvoyee = false;
-      piloterMoteur(-1); // Rejet immédiat
+      piloterMoteur(0); // Stop moteur avant la pause
     }
-    // Lecture Code
     else if (ScannerSerial.available())
     {
       String codeBrut = ScannerSerial.readStringUntil('\r');
@@ -309,127 +265,123 @@ void loop()
 
       if (codePropre.length() > 10)
       {
-        Serial.print(">>> CODE LU : "); Serial.println(codePropre);
-        Serial.println(">>> ✅ MODE TEST : CODE ACCEPTÉ");
+        Serial.print(">>> CODE OK: "); Serial.println(codePropre);
 
         portENTER_CRITICAL(&myMux);
         currentState = DEPOT_VALIDE;
-        timerEtat = millis();
-        bouteille_validee = false;
+        timerEtat = millis(); // On lance le timer global de 10s
         portEXIT_CRITICAL(&myMux);
 
-        // RESET COMPLET DU SUIVI TRACKING AVANT DÉMARRAGE
-        aVuEntree = false;
-        aVuSortie = false;
-        fraudeDetectee = false;
-
-        piloterMoteur(1); // Moteur AVANT
+        // Reset Tracking
+        aVuEntree = false; aVuSortie = false; fraudeDetectee = false; bouteille_validee = false;
+        
+        piloterMoteur(1); // En avant toute !
         commandeEnvoyee = false;
       }
     }
     break;
 
-  // --- ÉTAT 3 : CONVOYAGE & VALIDATION ---
   case DEPOT_VALIDE:
   {
-    // Lecture Capteurs avec INVERSION (!)
     byte ir1 = !digitalRead(PIN_IR_VALIDATION_1);
     byte ir2 = !digitalRead(PIN_IR_VALIDATION_2);
     int etatBinaire = (ir1 << 1) | ir2;
 
-    // --- ANALYSE SÉQUENCE ---
+    // Tracking
+    if (etatBinaire == 1 || etatBinaire == 0) { aVuEntree = true; if(aVuSortie) fraudeDetectee = true; }
+    if (etatBinaire == 2) { if(aVuEntree) aVuSortie = true; }
+
+    // --- VERDICTS ---
     
-    // 1. Passage Entrée (01 ou 00)
-    if (etatBinaire == 1 || etatBinaire == 0)
+    // CAS 1 : SUCCÈS (Sortie libérée)
+    if (etatBinaire == 3 && aVuEntree && aVuSortie && !fraudeDetectee && !bouteille_validee) 
     {
-      aVuEntree = true;
-      if (aVuSortie == true) // Si on revient en arrière
-      {
-        fraudeDetectee = true;
-        Serial.println(">>> ALERTE : Retour arrière !");
-      }
+       bouteille_validee = true;
+       Serial.println(">>> SUCCÈS ! Passage en mode chute...");
+       
+       // On ne bloque pas ! On change juste d'état pour attendre 500ms
+       portENTER_CRITICAL(&myMux);
+       currentState = ATTENTE_CHUTE;
+       timerEtat = millis();
+       portEXIT_CRITICAL(&myMux);
+       // Le moteur continue de tourner (1) pendant la chute
     }
-
-    // 2. Sortie imminente (10)
-    if (etatBinaire == 2)
+    
+    // CAS 2 : FRAUDE
+    else if (etatBinaire == 3 && aVuEntree && (!aVuSortie || fraudeDetectee))
     {
-      if (aVuEntree) aVuSortie = true;
+       Serial.println(">>> FRAUDE DÉTECTÉE -> Pause Rouge");
+       piloterMoteur(0); // Arrêt immédiat
+       
+       portENTER_CRITICAL(&myMux);
+       currentState = ATTENTE_REJET; // On va attendre 1s en rouge
+       timerEtat = millis();
+       portEXIT_CRITICAL(&myMux);
     }
 
-    // 3. Disparition (11) -> VERDICT
-    if (etatBinaire == 3) 
-    { 
-      // CAS A : SUCCÈS
-      if (aVuEntree && aVuSortie && !fraudeDetectee && !bouteille_validee) 
-      {
-        bouteille_validee = true;
-        Serial.println(">>> SÉQUENCE VALIDE (01->00->10->11) ✅");
-        
-        Serial.println(">>> Chute de la bouteille...");
-        delay(500);       // Temps de chute
-        piloterMoteur(0); // ARRÊT PROPRE
-        
-        portENTER_CRITICAL(&myMux);
-        currentState = BORNE_PRETE;
-        portEXIT_CRITICAL(&myMux);
-      }
-      
-      // CAS B : ÉCHEC / FRAUDE
-      else if (aVuEntree && (!aVuSortie || fraudeDetectee)) 
-      {
-        Serial.println(">>> REFUS : Séquence incorrecte ⛔");
-        piloterMoteur(0); // Stop
-        Serial.println(">>> Pause avant rejet...");
-        delay(1000); // Pause visuelle
-        
-        portENTER_CRITICAL(&myMux);
-        currentState = DEPOT_REFUSE;
-        timerEtat = millis();
-        portEXIT_CRITICAL(&myMux);
-        
-        piloterMoteur(-1); // Rejet
-      }
-    }
-
-    // CAS C : TIMEOUT GLOBAL (10s)
-    if (millis() - timerEtat > 10000)
+    // CAS 3 : TIMEOUT GLOBAL (5s)
+    if (millis() - timerEtat > 5000)
     {
-      Serial.println(">>> TIMEOUT (10s) : Bouteille bloquée");
-      piloterMoteur(0); // Stop
-      delay(1000); // Pause visuelle
-      
-      portENTER_CRITICAL(&myMux);
-      currentState = DEPOT_REFUSE;
-      timerEtat = millis();
-      portEXIT_CRITICAL(&myMux);
-      
-      piloterMoteur(-1); // Rejet
-      
-      // Reset Tracking
-      aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
+       Serial.println(">>> TIMEOUT GLOBAL -> Pause Rouge");
+       piloterMoteur(0); // Arrêt immédiat
+       
+       portENTER_CRITICAL(&myMux);
+       currentState = ATTENTE_REJET;
+       timerEtat = millis();
+       portEXIT_CRITICAL(&myMux);
     }
-
   }
   break;
 
-  // --- ÉTAT 4 : REJET (Marche Arrière 10s) ---
-  case DEPOT_REFUSE:
-    // On s'assure que le moteur recule
-    piloterMoteur(-1);
-
-    if (millis() - timerEtat > 10000)
+  // --- NOUVEAU : GESTION DE LA CHUTE (500ms) ---
+  case ATTENTE_CHUTE:
+    // On laisse le moteur tourner 500ms puis on coupe
+    if (millis() - timerEtat > 500)
     {
-      Serial.println(">>> Fin du rejet (10s écoulées)");
-      piloterMoteur(0); // Arrêt
+      Serial.println(">>> Chute terminée. Prêt.");
+      piloterMoteur(0);
       
       portENTER_CRITICAL(&myMux);
       currentState = BORNE_PRETE;
-      Serial.println(">>> Borne prête");
       portEXIT_CRITICAL(&myMux);
     }
     break;
 
-  // --- ÉTAT 5 : ERREUR BAC PLEIN ---
+  // --- NOUVEAU : LA PAUSE DRAMATIQUE (1s) ---
+  // Sert aussi de sécurité mécanique (moteur à l'arrêt avant inversion)
+  case ATTENTE_REJET:
+    piloterMoteur(0); // S'assure que c'est stoppé
+    
+    // On attend 1 seconde (pendant ce temps les LEDs sont rouges grâce à actualiserLeds)
+    if (millis() - timerEtat > 1000)
+    {
+      Serial.println(">>> Fin pause. Lancement MARCHE ARRIÈRE (10s).");
+      
+      portENTER_CRITICAL(&myMux);
+      currentState = REJET_EN_COURS;
+      timerEtat = millis();
+      portEXIT_CRITICAL(&myMux);
+      
+      piloterMoteur(-1); // On lance la marche arrière
+    }
+    break;
+
+  // --- ANCIEN "DEPOT_REFUSE" ---
+  case REJET_EN_COURS:
+    piloterMoteur(-1); // Maintient la marche arrière
+    
+    // On recule pendant 5 secondes
+    if (millis() - timerEtat > 5000)
+    {
+      Serial.println(">>> Fin du rejet.");
+      piloterMoteur(0);
+      
+      portENTER_CRITICAL(&myMux);
+      currentState = BORNE_PRETE;
+      portEXIT_CRITICAL(&myMux);
+    }
+    break;
+
   case BAC_PLEIN:
     piloterMoteur(0);
     break;
