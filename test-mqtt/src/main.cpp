@@ -7,22 +7,27 @@
 
 // ================= CONFIGURATION MATÉRIELLE =================
 #define W5500_CS_PIN 10   // Pin CS du module Ethernet
-#define LED_PIN 7
+#define LED_PIN 7 //vert
 #define NUM_LEDS 27
-#define SCANNER_RX_PIN 17
-#define SCANNER_TX_PIN 18
+#define SCANNER_RX_PIN 17 //violet tx to rx
+#define SCANNER_TX_PIN 18 //bleu rx to tx
 
 // I2C & Capteurs
 #define SRF02_ADDR 0x70
 #define SDA_PIN_sfr02 8
 #define SCL_PIN_sfr02 9
-#define PIN_IR_ENTREE 6
-#define PIN_IR_VALIDATION_1 2
-#define PIN_IR_VALIDATION_2 3
+
+#define PIN_IR_ENTREE 6 //blanc
+#define PIN_IR_VALIDATION_1 2 //bleu
+#define PIN_IR_VALIDATION_2 3 //jaune
+
+// --- CONFIGURATION DU BAC (En centimètres) ---
+#define HAUTEUR_BAC_VIDE 80  // Distance mesurée quand le bac vide
+#define HAUTEUR_BAC_PLEIN 20 // Distance mesurée quand les flocons touchent presque le capteur (mini 12cm car capteur ne fait pas en dessous)
 
 // Moteur
-#define MOTEUR_DIR1 20 
-#define MOTEUR_DIR2 21 
+#define MOTEUR_DIR1 20 //jaune
+#define MOTEUR_DIR2 21 //vert
 
 const byte COMMAND_TRIGGER[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
 
@@ -30,8 +35,8 @@ HardwareSerial ScannerSerial(2);
 CRGB leds[NUM_LEDS];
 
 // ================= CONFIGURATION RÉSEAU & MQTT =================
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED }; // Adresse MAC arbitraire
-IPAddress brokerIP(192, 168, 1, 100); // L'IP du Raspberry Pi de ton pote
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED }; // Adresse MAC esp32
+IPAddress brokerIP(192, 168, 1, 100); // L'IP du Raspberry Pi
 
 EthernetClient ethClient;
 PubSubClient mqttClient(ethClient);
@@ -127,10 +132,13 @@ void piloterMoteur(int sens)
   }
 }
 
+// --- GESTION DES LEDS ---
 void actualiserLeds()
 {
   static unsigned long lastBlink = 0;
-  if (millis() - lastBlink > 200) 
+  
+  // Vitesse de clignotement
+  if (millis() - lastBlink > 300) 
   {
     clignotementState = !clignotementState;
     lastBlink = millis();
@@ -143,14 +151,34 @@ void actualiserLeds()
 
   switch (etatLocal)
   {
-  case BORNE_PRETE:      fill_solid(leds, NUM_LEDS, CRGB::Green); break;
-  case BOUTEILLE_DETECTEE: fill_solid(leds, NUM_LEDS, CRGB::Blue); break;
-  case DEPOT_VALIDE:     fill_solid(leds, NUM_LEDS, clignotementState ? CRGB::Blue : CRGB::Black); break;
-  case ATTENTE_CHUTE:    fill_solid(leds, NUM_LEDS, CRGB::Green); break;
-  case ATTENTE_REJET:    fill_solid(leds, NUM_LEDS, CRGB::Red); break;
-  case REJET_EN_COURS:   fill_solid(leds, NUM_LEDS, clignotementState ? CRGB::Red : CRGB::Black); break;
-  case BAC_PLEIN:        fill_solid(leds, NUM_LEDS, CRGB::Red); break;
+  case BORNE_PRETE:
+  case ATTENTE_CHUTE:
+    // Vert fixe : borne en attente ou dépôt validé
+    fill_solid(leds, NUM_LEDS, CRGB::Green);
+    break;
+    
+  case BOUTEILLE_DETECTEE:
+    // Bleu fixe : présence d'une bouteille
+    fill_solid(leds, NUM_LEDS, CRGB::Blue);
+    break;
+    
+  case DEPOT_VALIDE:
+    // Bleu clignotant : code-barre reconnu (Bouteille acceptée et en route)
+    fill_solid(leds, NUM_LEDS, clignotementState ? CRGB::Blue : CRGB::Black);
+    break;
+
+  case ATTENTE_REJET:
+  case REJET_EN_COURS:
+    // Rouge clignotant : bouteille refusée (fraude, timeout, ou mauvais code)
+    fill_solid(leds, NUM_LEDS, clignotementState ? CRGB::Red : CRGB::Black);
+    break;
+    
+  case BAC_PLEIN:
+    // Rouge fixe : bac plein
+    fill_solid(leds, NUM_LEDS, CRGB::Red);
+    break;
   }
+  
   FastLED.show();
 }
 
@@ -214,20 +242,6 @@ void loop()
   // Maintient la connexion réseau active et se reconnecte si besoin
   gererMQTT();
 
-  // Surveillance Bac
-  static unsigned long lastCheckBac = 0;
-  if (millis() - lastCheckBac > 2000)
-  {
-    int dist = lireSRF02(); 
-    if (dist > 0 && dist < 10)
-    {
-      portENTER_CRITICAL(&myMux);
-      currentState = BAC_PLEIN;
-      portEXIT_CRITICAL(&myMux);
-    }
-    lastCheckBac = millis();
-  }
-
   // --- MACHINE À ÉTATS ---
   State etatActuel;
   portENTER_CRITICAL(&myMux);
@@ -237,7 +251,30 @@ void loop()
   switch (etatActuel)
   {
   case BORNE_PRETE:
-    piloterMoteur(0); 
+    piloterMoteur(0); // S'assure que le moteur est coupé
+    
+    //VÉRIFICATION "EN VEILLE" (Toutes les 10 secondes)
+   
+    static unsigned long lastIdleCheck = 0;
+    if (millis() - lastIdleCheck > 10000) 
+    {
+       int dist = lireSRF02();
+       // Si on détecte que c'est plein même au repos
+       if (dist > 0 && dist <= HAUTEUR_BAC_PLEIN) 
+       {
+          Serial.println(">>> ⚠️ ALERTE VEILLE : Bac plein détecté avant dépôt !");
+          portENTER_CRITICAL(&myMux);
+          currentState = BAC_PLEIN;
+          portEXIT_CRITICAL(&myMux);
+          
+          // Optionnel : Alerte MQTT
+          if (mqttClient.connected()) mqttClient.publish("ecobox/alerte", "BAC_PLEIN_VEILLE");
+       }
+       lastIdleCheck = millis();
+    }
+    // =========================================================
+
+    // --- L'attente du client (ce que tu avais déjà) ---
     portENTER_CRITICAL(&myMux);
     if (interruptionEntree)
     {
@@ -340,7 +377,7 @@ void loop()
        portEXIT_CRITICAL(&myMux);
     }
 
-    if (millis() - timerEtat > 5000)
+    if (millis() - timerEtat > 11000)
     {
        Serial.println(">>> TIMEOUT GLOBAL -> Pause Rouge");
        piloterMoteur(0); 
@@ -356,12 +393,63 @@ void loop()
   case ATTENTE_CHUTE:
     if (millis() - timerEtat > 500)
     {
-      Serial.println(">>> Chute terminée. Prêt.");
-      piloterMoteur(0);
+      Serial.println(">>> Chute de la bouteille terminée.");
+      piloterMoteur(0); 
       
-      portENTER_CRITICAL(&myMux);
-      currentState = BORNE_PRETE;
-      portEXIT_CRITICAL(&myMux);
+      // =========================================================
+      // CALCUL DU TAUX DE REMPLISSAGE ET ENVOI MQTT
+      // =========================================================
+      Serial.println(">>> Mesure du niveau du bac...");
+      int dist = lireSRF02(); 
+      
+      if (dist == -1) {
+        Serial.println(">>> ❌ ERREUR CAPTEUR SRF02 (Vérifier câblage)");
+        // En cas d'erreur, on repasse en attente par défaut pour ne pas bloquer la machine
+        portENTER_CRITICAL(&myMux);
+        currentState = BORNE_PRETE;
+        portEXIT_CRITICAL(&myMux);
+      } 
+      else 
+      {
+        // 1. Calcul du pourcentage (Taux de remplissage)
+        int taux = 0;
+        if (dist >= HAUTEUR_BAC_VIDE) taux = 0;
+        else if (dist <= HAUTEUR_BAC_PLEIN) taux = 100;
+        else {
+          // Produit en croix inversé (plus la distance est petite, plus le taux est grand)
+          taux = ((HAUTEUR_BAC_VIDE - dist) * 100) / (HAUTEUR_BAC_VIDE - HAUTEUR_BAC_PLEIN);
+        }
+
+        Serial.print(">>> Distance : "); Serial.print(dist); Serial.println(" cm");
+        Serial.print(">>> TAUX DE REMPLISSAGE : "); Serial.print(taux); Serial.println(" %");
+
+        // 2. Envoi MQTT pour la Base de Données
+        if (mqttClient.connected()) {
+          String payload = String(taux);
+          mqttClient.publish("ecobox/niveau", payload.c_str());
+          Serial.println(">>> 📡 Taux envoyé au serveur BDD (MQTT)");
+        }
+
+        // 3. Décision : Verrouillage ou Suite
+        portENTER_CRITICAL(&myMux);
+        if (taux >= 100) // Le bac est plein
+        {
+          Serial.println(">>> ⚠️ ALERTE : BAC PLEIN ! Verrouillage de la borne.");
+          currentState = BAC_PLEIN;
+          
+          // Alerte instantanée pour le responsable
+          if (mqttClient.connected()) {
+            mqttClient.publish("ecobox/alerte", "BAC_PLEIN");
+          }
+        }
+        else 
+        {
+          Serial.println(">>> Borne prête pour la prochaine bouteille.");
+          currentState = BORNE_PRETE;
+        }
+        portEXIT_CRITICAL(&myMux);
+      }
+      // =========================================================
     }
     break;
 
@@ -384,7 +472,7 @@ void loop()
   case REJET_EN_COURS:
     piloterMoteur(-1); 
     
-    if (millis() - timerEtat > 5000)
+    if (millis() - timerEtat > 11000)
     {
       Serial.println(">>> Fin du rejet.");
       piloterMoteur(0);
@@ -396,7 +484,21 @@ void loop()
     break;
 
   case BAC_PLEIN:
-    piloterMoteur(0);
+    piloterMoteur(0); // Sécurité : moteur coupé
+    
+    // On vérifie le niveau toutes les 5 secondes pour voir si le responsable a vidé le bac
+    if (millis() - timerEtat > 5000) 
+    {
+       int dist = lireSRF02();
+       if (dist > HAUTEUR_BAC_PLEIN + 5) // Si la distance s'est agrandie (avec 5cm de marge pour éviter les faux positifs)
+       {
+          Serial.println(">>> ✅ BAC VIDÉ PAR LE RESPONSABLE. Déverrouillage.");
+          portENTER_CRITICAL(&myMux);
+          currentState = BORNE_PRETE;
+          portEXIT_CRITICAL(&myMux);
+       }
+       timerEtat = millis(); // On reset le chrono des 5 secondes
+    }
     break;
   }
 }

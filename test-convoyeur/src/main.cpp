@@ -5,22 +5,23 @@
 #include "esp_system.h"
 
 // ================= CONFIGURATION MATÉRIELLE =================
-#define LED_PIN 7
+#define LED_PIN 7  //vert
 #define NUM_LEDS 27
-#define SCANNER_RX_PIN 17
-#define SCANNER_TX_PIN 18
+#define SCANNER_RX_PIN 17  //violet (tx to rx)
+#define SCANNER_TX_PIN 18  //bleu (rx to tx)
 
 // I2C & Capteurs
 #define SRF02_ADDR 0x70
-#define SDA_PIN_sfr02 8
-#define SCL_PIN_sfr02 9
-#define PIN_IR_ENTREE 6
-#define PIN_IR_VALIDATION_1 2
-#define PIN_IR_VALIDATION_2 3
+#define SDA_PIN_sfr02 8 //vert
+#define SCL_PIN_sfr02 9 //blanc
+
+#define PIN_IR_ENTREE 6  //blanc
+#define PIN_IR_VALIDATION_1 2  //bleu
+#define PIN_IR_VALIDATION_2 3  //jaune
 
 // Moteur
-#define MOTEUR_DIR1 20 
-#define MOTEUR_DIR2 21 
+#define MOTEUR_DIR1 20 //jaune
+#define MOTEUR_DIR2 21 //vert
 
 const byte COMMAND_TRIGGER[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
 
