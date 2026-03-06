@@ -334,7 +334,7 @@ void loop()
   }
   break;
 
-  // --- NOUVEAU : GESTION DE LA CHUTE (500ms) ---
+  // --- NOUVEAU : GESTION DE LA CHUTE (500ms) ----
   case ATTENTE_CHUTE:
     // On laisse le moteur tourner 500ms puis on coupe
     if (millis() - timerEtat > 500)
