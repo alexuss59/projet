@@ -1,40 +1,52 @@
+// =========================================================
+//  PROJET BTS CIEL - BORNE DE COLLECTE BOUTEILLES PET
+//  VERSION DEBUG MULTI-CAPTEURS — Analyse IR transparente
+// =========================================================
+
 #include <SPI.h>
 #include <Ethernet.h>
-#include <PubSubClient.h> 
+#include <PubSubClient.h>
 #include <FastLED.h>
 #include <Wire.h>
 #include "esp_system.h"
 
-// ================= CONFIGURATION MATÉRIELLE =================
-#define W5500_CS_PIN 10   
-#define LED_PIN 7         
-#define NUM_LEDS 27
-#define SCANNER_RX_PIN 17 
-#define SCANNER_TX_PIN 18 
+// =========================================================
+//  ⚙️ PARAMÈTRES DEBUG — MODIFIE ICI
+// =========================================================
 
-// I2C & Capteurs
+#define MODE_DEBUG_IR true
+#define DEBOUNCE_DELAY_MS 50 // Filtre anti-rebond global
+
+// =========================================================
+//  CONFIGURATION MATÉRIELLE
+// =========================================================
+
+#define W5500_CS_PIN 10
+#define LED_PIN 7
+#define NUM_LEDS 27
+#define SCANNER_RX_PIN 17
+#define SCANNER_TX_PIN 18
+
 #define SRF02_ADDR 0x70
 #define SDA_PIN_sfr02 8
 #define SCL_PIN_sfr02 9
 
 #define PIN_IR_ENTREE 6       
-#define PIN_IR_VALIDATION_1 2 
-#define PIN_IR_VALIDATION_2 3 
+#define PIN_IR_VALIDATION_1 2
+#define PIN_IR_VALIDATION_2 3
 
-#define HAUTEUR_BAC_VIDE 80  
-#define HAUTEUR_BAC_PLEIN 20 
+#define HAUTEUR_BAC_VIDE 80
+#define HAUTEUR_BAC_PLEIN 20
 
-#define MOTEUR_DIR1 20 
-#define MOTEUR_DIR2 21 
+#define MOTEUR_DIR1 20
+#define MOTEUR_DIR2 21
 
 const byte COMMAND_TRIGGER[] = {0x7E, 0x00, 0x08, 0x01, 0x00, 0x02, 0x01, 0xAB, 0xCD};
 
-// ================= OBJETS GLOBAUX =================
 HardwareSerial ScannerSerial(2);
 CRGB leds[NUM_LEDS];
-
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED }; 
-IPAddress brokerIP(192, 168, 1, 100); 
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress brokerIP(192, 168, 1, 100);
 
 EthernetClient ethClient;
 PubSubClient mqttClient(ethClient);
@@ -42,9 +54,22 @@ PubSubClient mqttClient(ethClient);
 portMUX_TYPE myMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool interruptionEntree = false;
 
+volatile unsigned long dernierDeclenchement = 0; 
+volatile int compteurInterruptionsTotal   = 0;    
+volatile int compteurInterruptionsValides = 0;   
+
+// =========================================================
+//  INTERRUPTION MATÉRIELLE (Entrée)
+// =========================================================
 void IRAM_ATTR ISR_Entree() {
   portENTER_CRITICAL_ISR(&myMux);
-  interruptionEntree = true;
+  unsigned long maintenant = millis();
+  compteurInterruptionsTotal++; 
+  if (maintenant - dernierDeclenchement >= DEBOUNCE_DELAY_MS) {
+    interruptionEntree = true;
+    dernierDeclenchement = maintenant;
+    compteurInterruptionsValides++; 
+  }
   portEXIT_CRITICAL_ISR(&myMux);
 }
 
@@ -59,34 +84,17 @@ enum State {
 };
 
 // =========================================================
-//                   CLASSES MATÉRIELLES
+//  CLASSES MATÉRIELLES
 // =========================================================
-
 class MoteurConvoyeur {
   private:
     int pin1, pin2;
   public:
     MoteurConvoyeur(int p1, int p2) : pin1(p1), pin2(p2) {}
-    
-    void init() {
-      pinMode(pin1, OUTPUT);
-      pinMode(pin2, OUTPUT);
-      stopper();
-    }
-    void avancer() {
-      Serial.println(">>> MOTEUR : AVANT");
-      digitalWrite(pin1, HIGH);
-      digitalWrite(pin2, LOW);
-    }
-    void reculer() {
-      Serial.println(">>> MOTEUR : ARRIÈRE");
-      digitalWrite(pin1, LOW);
-      digitalWrite(pin2, HIGH);
-    }
-    void stopper() {
-      digitalWrite(pin1, LOW);
-      digitalWrite(pin2, LOW);
-    }
+    void init() { pinMode(pin1, OUTPUT); pinMode(pin2, OUTPUT); stopper(); }
+    void avancer() { digitalWrite(pin1, HIGH); digitalWrite(pin2, LOW); }
+    void reculer() { digitalWrite(pin1, LOW); digitalWrite(pin2, HIGH); }
+    void stopper() { digitalWrite(pin1, LOW); digitalWrite(pin2, LOW); }
 };
 
 class CapteurUltrason {
@@ -94,16 +102,14 @@ class CapteurUltrason {
     int adresseI2C;
   public:
     CapteurUltrason(int addr) : adresseI2C(addr) {}
-
     int lireDistance() {
       Wire.beginTransmission(adresseI2C); Wire.write(0x00); Wire.write(0x51); Wire.endTransmission();
-      delay(70); 
+      delay(70);
       Wire.beginTransmission(adresseI2C); Wire.write(0x02); Wire.endTransmission();
       Wire.requestFrom(adresseI2C, 2);
       if (Wire.available() >= 2) return (Wire.read() << 8) | Wire.read();
-      return -1; 
+      return -1;
     }
-
     int calculerTauxRemplissage(int distance) {
       if (distance >= HAUTEUR_BAC_VIDE) return 0;
       if (distance <= HAUTEUR_BAC_PLEIN) return 100;
@@ -112,24 +118,69 @@ class CapteurUltrason {
 };
 
 // =========================================================
-//             CLASSE PRINCIPALE : LE CONTRÔLEUR
+//  FONCTION DEBUG IR MULTI-CAPTEURS
+//  Analyse indépendante des bounces pour Entrée, Val1 et Val2
 // =========================================================
+void debugIR() {
+  static byte lastEtats = 255; 
+  static unsigned long dernierChg[3] = {0, 0, 0}; 
+  static int cptBounces[3] = {0, 0, 0}; 
+  static unsigned long debutBounce[3] = {0, 0, 0}; 
+  static byte lastIr[3] = {0, 0, 0}; 
 
+  byte ir[3];
+  ir[0] = !digitalRead(PIN_IR_ENTREE);
+  ir[1] = !digitalRead(PIN_IR_VALIDATION_1);
+  ir[2] = !digitalRead(PIN_IR_VALIDATION_2);
+
+  byte etatsActuels = (ir[0] << 2) | (ir[1] << 1) | ir[2];
+
+  if (etatsActuels != lastEtats) {
+    unsigned long maintenant = millis();
+
+    for (int i = 0; i < 3; i++) {
+      if (ir[i] != lastIr[i]) {
+        unsigned long duree = maintenant - dernierChg[i];
+        String nomCapteur = (i == 0) ? "ENTRÉE" : (i == 1) ? "VAL1" : "VAL2";
+
+        if (duree < DEBOUNCE_DELAY_MS && dernierChg[i] != 0) {
+          cptBounces[i]++;
+          if (cptBounces[i] == 1) debutBounce[i] = dernierChg[i];
+          Serial.print(" ⚡ BOUNCE ["); Serial.print(nomCapteur); Serial.print("] #"); 
+          Serial.print(cptBounces[i]); Serial.print(" (Micro-coupure: "); 
+          Serial.print(duree); Serial.println("ms)");
+        } else {
+          if (cptBounces[i] > 0) {
+            Serial.print(" ✅ STABILISÉ ["); Serial.print(nomCapteur); Serial.print("] | ");
+            Serial.print(cptBounces[i]); Serial.print(" rebonds sur ");
+            Serial.print(maintenant - debutBounce[i]); Serial.println("ms total.");
+            cptBounces[i] = 0;
+          }
+          // Log normal si ce n'est pas un bounce
+          Serial.print("⏱ "); Serial.print(maintenant); Serial.print("ms | ");
+          Serial.print(nomCapteur); Serial.print(" -> "); 
+          Serial.println(ir[i] ? "Coupé (Bouteille vue)" : "Libre (Vide)");
+        }
+        lastIr[i] = ir[i];
+        dernierChg[i] = maintenant;
+      }
+    }
+    lastEtats = etatsActuels;
+  }
+}
+
+// =========================================================
+//  CLASSE PRINCIPALE : LE CONTRÔLEUR
+// =========================================================
 class ControleurEcoBox {
   private:
     State currentState;
     unsigned long timerEtat;
     bool clignotementState;
     unsigned long lastMQTTReconnect;
-    
     bool aVuEntree, aVuSortie, fraudeDetectee, bouteille_validee;
     bool commandeScanEnvoyee;
     int nombreBouteilles;
-
-    // Chronos pour le filtre plastique transparent
-    unsigned long timerPerteVal1;
-    unsigned long timerPerteVal2;
-
     MoteurConvoyeur moteur;
     CapteurUltrason capteurBac;
 
@@ -142,19 +193,6 @@ class ControleurEcoBox {
     void resetTracking() {
       aVuEntree = false; aVuSortie = false; fraudeDetectee = false;
       bouteille_validee = false; commandeScanEnvoyee = false;
-      timerPerteVal1 = 0; timerPerteVal2 = 0;
-    }
-
-    // Filtre Anti-Rebond pour les bouteilles transparentes
-    bool lireCapteurFiltre(int pin, unsigned long &timerPerte) {
-      bool etatBrut = !digitalRead(pin); 
-      if (etatBrut == true) {
-        timerPerte = millis(); 
-        return true; 
-      } else {
-        if (millis() - timerPerte < 150) return true; 
-        else return false; 
-      }
     }
 
     void gererReseau() {
@@ -182,9 +220,7 @@ class ControleurEcoBox {
   public:
     ControleurEcoBox() : moteur(MOTEUR_DIR1, MOTEUR_DIR2), capteurBac(SRF02_ADDR) {
       currentState = BORNE_PRETE;
-      clignotementState = false;
-      lastMQTTReconnect = 0;
-      nombreBouteilles = 0; 
+      nombreBouteilles = 0;
       resetTracking();
     }
 
@@ -204,15 +240,14 @@ class ControleurEcoBox {
       }
 
       switch (currentState) {
+
         case BORNE_PRETE: {
           moteur.stopper();
           static unsigned long lastIdleCheck = 0;
           if (millis() - lastIdleCheck > 10000) {
             int dist = capteurBac.lireDistance();
             if (dist > 0 && dist <= HAUTEUR_BAC_PLEIN) {
-              Serial.println(">>> ⚠️ ALERTE VEILLE : Bac plein détecté avant dépôt !");
               currentState = BAC_PLEIN;
-              if (mqttClient.connected()) mqttClient.publish("ecobox/alerte", "BAC_PLEIN_VEILLE");
             }
             lastIdleCheck = millis();
           }
@@ -220,58 +255,49 @@ class ControleurEcoBox {
           portENTER_CRITICAL(&myMux);
           if (interruptionEntree && currentState == BORNE_PRETE) {
             interruptionEntree = false;
-            currentState = BOUTEILLE_DETECTEE;
-            timerEtat = millis();
-            while (ScannerSerial.available()) ScannerSerial.read();
-            Serial.println("\n>>> BOUTEILLE DÉTECTÉE");
+            
+            #if MODE_DEBUG_IR
+              // BYPASS : On saute le scan et on démarre le moteur pour le test d'oscillo
+              Serial.println("\n>>> 🔧 [DEBUG] Bouteille vue à l'entrée -> Démarrage direct du tapis !");
+              currentState = DEPOT_VALIDE;
+              timerEtat = millis();
+              moteur.avancer();
+            #else
+              currentState = BOUTEILLE_DETECTEE;
+              timerEtat = millis();
+              while (ScannerSerial.available()) ScannerSerial.read();
+            #endif
           }
           portEXIT_CRITICAL(&myMux);
           break;
         }
 
         case BOUTEILLE_DETECTEE:
+          // Le code du scanner reste ici pour la prod, ignoré en mode DEBUG
           if (!commandeScanEnvoyee) {
             while (ScannerSerial.available()) ScannerSerial.read();
             ScannerSerial.write(0x00); delay(50); 
             ScannerSerial.write(COMMAND_TRIGGER, sizeof(COMMAND_TRIGGER));
             commandeScanEnvoyee = true; timerEtat = millis();
           }
-
           if (millis() - timerEtat > 3000) {
-            Serial.println(">>> TIMEOUT SCAN -> Rejet (Aucun code lu en 3s)");
-            
-            // ==========================================
-            // ALERTE MQTT : ERREUR DE SCAN
-            // ==========================================
-            if (mqttClient.connected()) {
-              mqttClient.publish("ecobox/rejet", "ERREUR_SCAN");
-            }
-
-            currentState = ATTENTE_REJET;
-            timerEtat = millis();
-            moteur.stopper();
-            commandeScanEnvoyee = false; 
+            currentState = ATTENTE_REJET; timerEtat = millis();
+            moteur.stopper(); commandeScanEnvoyee = false;
           } 
           else if (ScannerSerial.available()) {
-            String codeBrut = ScannerSerial.readStringUntil('\r');
-            String codePropre = nettoyerCode(codeBrut);
+            String codePropre = nettoyerCode(ScannerSerial.readStringUntil('\r'));
             if (codePropre.length() > 10) {
-              Serial.print(">>> CODE VALIDE : "); Serial.println(codePropre);
-              if (mqttClient.connected()) {
-                mqttClient.publish("ecobox/print", codePropre.c_str());
-              } 
+              if (mqttClient.connected()) mqttClient.publish("ecobox/print", codePropre.c_str());
               resetTracking();
-              currentState = DEPOT_VALIDE;
-              timerEtat = millis();
+              currentState = DEPOT_VALIDE; timerEtat = millis();
               moteur.avancer();
             }
           }
           break;
 
         case DEPOT_VALIDE: {
-          // Lecture via notre filtre anti-rebond pour le plastique transparent
-          byte ir1 = lireCapteurFiltre(PIN_IR_VALIDATION_1, timerPerteVal1);
-          byte ir2 = lireCapteurFiltre(PIN_IR_VALIDATION_2, timerPerteVal2);
+          byte ir1 = !digitalRead(PIN_IR_VALIDATION_1);
+          byte ir2 = !digitalRead(PIN_IR_VALIDATION_2);
           int etatBinaire = (ir1 << 1) | ir2;
 
           if (etatBinaire == 1) { aVuEntree = true; if(aVuSortie) fraudeDetectee = true; }
@@ -279,96 +305,58 @@ class ControleurEcoBox {
 
           if (etatBinaire == 3 && aVuEntree && aVuSortie && !fraudeDetectee && !bouteille_validee) {
              bouteille_validee = true;
-             nombreBouteilles++; 
-             Serial.println(">>> SUCCÈS ! Passage en mode chute...");
-             Serial.print(">>> 🍾 BOUTEILLES RECYCLÉES : "); Serial.println(nombreBouteilles);
-
-             if (mqttClient.connected()) mqttClient.publish("ecobox/compteur", String(nombreBouteilles).c_str());
-
+             nombreBouteilles++;
+             Serial.println("\n>>> 🏁 FIN DE COURSE (Bouteille validée)");
              currentState = ATTENTE_CHUTE;
              timerEtat = millis();
           } 
+          #if !MODE_DEBUG_IR
+          // En prod : la fraude coupe tout.
           else if (etatBinaire == 3 && aVuEntree && (!aVuSortie || fraudeDetectee)) {
-             Serial.println(">>> FRAUDE DÉTECTÉE -> Pause Rouge");
-             
-             // ==========================================
-             // ALERTE MQTT : FRAUDE
-             // ==========================================
-             if (mqttClient.connected()) {
-               mqttClient.publish("ecobox/rejet", "FRAUDE");
-             }
-
              moteur.stopper();
              currentState = ATTENTE_REJET;
              timerEtat = millis();
           }
+          #else
+          // En DEBUG : On laisse le moteur tourner même si les rebonds génèrent une "fraude" 
+          // pour pouvoir analyser les deux capteurs jusqu'au bout.
+          #endif
 
           if (millis() - timerEtat > 11000) {
-             Serial.println(">>> TIMEOUT GLOBAL -> Pause Rouge");
-             
-             // ==========================================
-             // ALERTE MQTT : TIMEOUT CONVOYEUR (Bouteille coincée)
-             // ==========================================
-             if (mqttClient.connected()) {
-               mqttClient.publish("ecobox/rejet", "TIMEOUT_CONVOYEUR");
-             }
-
+             Serial.println(">>> 🛑 TIMEOUT 11s -> Fin du test, arrêt du moteur.");
              moteur.stopper();
-             currentState = ATTENTE_REJET;
-             timerEtat = millis();
+             currentState = BORNE_PRETE; // On revient au début directement en debug
+             resetTracking();
           }
           break;
         }
 
         case ATTENTE_CHUTE:
-          if (millis() - timerEtat > 500) { // On laisse bien 500ms pour la chute
-            Serial.println(">>> Chute de la bouteille terminée.");
+          // On passe de 500ms à 2500ms (2.5 secondes) pour être sûr qu'elle a le temps de tomber
+          if (millis() - timerEtat > 2500) {
+            Serial.println(">>> Chute de la bouteille terminée (Moteur coupé).");
             moteur.stopper();
-            
-            int dist = capteurBac.lireDistance();
-            if (dist == -1) {
-              currentState = BORNE_PRETE;
-            } else {
-              int taux = capteurBac.calculerTauxRemplissage(dist);
-              if (mqttClient.connected()) mqttClient.publish("ecobox/niveau", String(taux).c_str());
-
-              if (taux >= 95) {
-                Serial.println(">>> ⚠️ ALERTE : BAC PLEIN ! Verrouillage de la borne.");
-                currentState = BAC_PLEIN;
-                if (mqttClient.connected()) mqttClient.publish("ecobox/alerte", "BAC_PLEIN");
-              } else {
-                currentState = BORNE_PRETE;
-              }
-            }
+            currentState = BORNE_PRETE;
           }
           break;
 
         case ATTENTE_REJET:
           moteur.stopper();
           if (millis() - timerEtat > 1000) {
-            Serial.println(">>> Fin pause. Lancement MARCHE ARRIÈRE (10s).");
-            currentState = REJET_EN_COURS;
-            timerEtat = millis();
-            moteur.reculer();
+            currentState = REJET_EN_COURS; timerEtat = millis(); moteur.reculer();
           }
           break;
 
         case REJET_EN_COURS:
           if (millis() - timerEtat > 11000) {
-            Serial.println(">>> Fin du rejet.");
-            moteur.stopper();
-            currentState = BORNE_PRETE;
+            moteur.stopper(); currentState = BORNE_PRETE;
           }
           break;
 
         case BAC_PLEIN:
           moteur.stopper();
           if (millis() - timerEtat > 5000) {
-            int dist = capteurBac.lireDistance();
-            if (dist > HAUTEUR_BAC_PLEIN + 5) {
-              Serial.println(">>> ✅ BAC VIDÉ PAR LE RESPONSABLE. Déverrouillage.");
-              currentState = BORNE_PRETE;
-            }
+            if (capteurBac.lireDistance() > HAUTEUR_BAC_PLEIN + 5) currentState = BORNE_PRETE;
             timerEtat = millis();
           }
           break;
@@ -376,39 +364,33 @@ class ControleurEcoBox {
     }
 };
 
-// =========================================================
-//                   PROGRAMME PRINCIPAL
-// =========================================================
-
 ControleurEcoBox maBorne;
 
 void setup() {
   Serial.begin(115200);
   Wire.begin(SDA_PIN_sfr02, SCL_PIN_sfr02);
-  
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   ScannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX_PIN, SCANNER_TX_PIN);
-  
   maBorne.init();
   
-  // Correction: FALLING pour détecter la coupe du faisceau
+  // CORRECTION MAJEURE ICI : FALLING au lieu de RISING
   attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, FALLING);
 
-  Serial.println(">>> Initialisation du réseau Ethernet W5500...");
-  Ethernet.init(W5500_CS_PIN); 
-
-  if (Ethernet.begin(mac) == 0) {
-    Serial.println(">>> ❌ Échec de la configuration DHCP");
-  } else {
-    Serial.print(">>> ✅ Connecté au réseau. IP : ");
-    Serial.println(Ethernet.localIP());
-  }
-
+  Ethernet.init(W5500_CS_PIN);
+  Ethernet.begin(mac);
   mqttClient.setServer(brokerIP, 1883);
-  
-  Serial.println("=== SYSTÈME DÉMARRÉ (VERSION POO FINALE) ===");
+
+  Serial.println("===========================================");
+  Serial.println("=== SYSTÈME DÉMARRÉ - VERSION DEBUG IR ===");
+  Serial.println(">>> Les bouteilles bypass le scanner et déclenchent le moteur direct !");
+  Serial.println(">>> Prêt pour l'analyse à l'oscilloscope.");
+  Serial.println("===========================================");
 }
 
 void loop() {
+  #if MODE_DEBUG_IR
+    debugIR();
+  #endif
+
   maBorne.executerCycle();
 }
