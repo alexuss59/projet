@@ -87,7 +87,7 @@ class CapteurUltrason {
     }
 };
 
-class ControleurEcoBox {
+class ControllerCrystaRecycle {
   private:
     State currentState;
     unsigned long timerEtat;
@@ -129,7 +129,7 @@ class ControleurEcoBox {
         timerPerte = millis(); 
         return true; 
       } else {
-        if (millis() - timerPerte < 250) return true; 
+        if (millis() - timerPerte < 50) return true; 
         else return false; 
       }
     }
@@ -157,7 +157,7 @@ class ControleurEcoBox {
     }
 
   public:
-    ControleurEcoBox() : moteur(MOTEUR_DIR1, MOTEUR_DIR2), capteurBac(SRF02_ADDR) {
+    ControllerCrystaRecycle() : moteur(MOTEUR_DIR1, MOTEUR_DIR2), capteurBac(SRF02_ADDR) {
       currentState = BORNE_PRETE;
       clignotementState = false;
       lastMQTTReconnect = 0;
@@ -168,8 +168,8 @@ class ControleurEcoBox {
     void init() {
       moteur.init();
       pinMode(PIN_IR_ENTREE, INPUT_PULLUP);
-      pinMode(PIN_IR_VALIDATION_1, INPUT_PULLDOWN);
-      pinMode(PIN_IR_VALIDATION_2, INPUT_PULLDOWN);
+      pinMode(PIN_IR_VALIDATION_1, INPUT);
+      pinMode(PIN_IR_VALIDATION_2, INPUT);
     }
 
     void executerCycle() {
@@ -301,6 +301,10 @@ class ControleurEcoBox {
           else if (millis() - timerEtat > 500) { 
             Serial.println(">>> 🏁 CHUTE TERMINÉE PROPREMENT.");
             moteur.stopper();
+
+            if (mqttClient.connected()) {
+              mqttClient.publish("ecobox/accepte", "OK");
+            }
             
             nombreBouteilles++; 
             Serial.print(">>> 🍾 BOUTEILLES RECYCLÉES : "); Serial.println(nombreBouteilles);
@@ -358,7 +362,7 @@ class ControleurEcoBox {
     }
 };
 
-ControleurEcoBox maBorne;
+ControllerCrystaRecycle maBorne;
 
 void setup() {
   Serial.begin(115200);
