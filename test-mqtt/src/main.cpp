@@ -94,12 +94,14 @@ class ControllerCrystaRecycle {
     bool clignotementState;
     unsigned long lastMQTTReconnect;
     
-    // Suivi strict anti-fraude
     int etapeMax; 
     bool fraudeDetectee;
     bool bouteille_validee;
     bool commandeScanEnvoyee;
     int nombreBouteilles;
+    
+    // NOUVEAU : Variable pour gérer le temps de marche arrière
+    unsigned long tempsDeRejet; 
 
     unsigned long timerPerteVal1;
     unsigned long timerPerteVal2;
@@ -120,11 +122,11 @@ class ControllerCrystaRecycle {
       commandeScanEnvoyee = false;
       timerPerteVal1 = 0; 
       timerPerteVal2 = 0;
+      tempsDeRejet = 11000; // Par défaut, un rejet long si elle est loin
     }
 
-    // Lisse les trous optiques du plastique transparent (250ms de tolérance)
     bool capteurVoitBouteille(int pin, unsigned long &timerPerte) {
-      bool voitObjet = (digitalRead(pin) == HIGH); // Logique matérielle (PULLDOWN)
+      bool voitObjet = (digitalRead(pin) == HIGH);
       if (voitObjet) {
         timerPerte = millis(); 
         return true; 
@@ -138,7 +140,10 @@ class ControllerCrystaRecycle {
       if (!mqttClient.connected()) {
         if (millis() - lastMQTTReconnect > 5000) {
           lastMQTTReconnect = millis();
-          if (mqttClient.connect("Borne_Ecobox")) Serial.println(">>> ✅ Connecté au Broker MQTT !");
+          if (mqttClient.connect("Borne_Ecobox")) {
+            Serial.println(">>> ✅ Connecté au Broker MQTT !");
+            mqttClient.subscribe("ecobox/action"); 
+          }
         }
       } else mqttClient.loop();
     }
@@ -170,6 +175,16 @@ class ControllerCrystaRecycle {
       pinMode(PIN_IR_ENTREE, INPUT_PULLUP);
       pinMode(PIN_IR_VALIDATION_1, INPUT);
       pinMode(PIN_IR_VALIDATION_2, INPUT);
+    }
+
+    void forcerActionServeur() {
+      if (currentState == ATTENTE_REJET || currentState == REJET_EN_COURS) {
+        Serial.println(">>> 🟢 ACTION SERVEUR : L'utilisateur a cliqué sur 'Réessayer'. Arrêt du tapis !");
+        moteur.stopper();
+        resetTracking();
+        currentState = BORNE_PRETE;
+        timerEtat = millis();
+      }
     }
 
     void executerCycle() {
@@ -214,8 +229,12 @@ class ControllerCrystaRecycle {
           }
 
           if (millis() - timerEtat > 3000) {
-            Serial.println(">>> TIMEOUT SCAN -> Rejet");
+            Serial.println(">>> TIMEOUT SCAN -> Rejet rapide (3s)");
             if (mqttClient.connected()) mqttClient.publish("ecobox/rejet", "ERREUR_SCAN");
+            
+            // NOUVEAU : On paramètre un rejet très court car la bouteille est juste à l'entrée
+            tempsDeRejet = 3000; 
+            
             currentState = ATTENTE_REJET;
             timerEtat = millis();
             moteur.stopper();
@@ -238,39 +257,35 @@ class ControllerCrystaRecycle {
           bool ir1_coupe = capteurVoitBouteille(PIN_IR_VALIDATION_1, timerPerteVal1);
           bool ir2_coupe = capteurVoitBouteille(PIN_IR_VALIDATION_2, timerPerteVal2);
           
-          // Conversion binaire : 0=Vide, 2=VAL1, 3=VAL1+VAL2, 1=VAL2
           int etatBinaire = (ir1_coupe ? 2 : 0) | (ir2_coupe ? 1 : 0);
 
-          // MACHINE À ÉTATS STRICTE
-          if (etatBinaire == 2) { // 01 (Seul VAL1 coupé)
-              if (etapeMax == 0) etapeMax = 1; // Avancée normale
-              else if (etapeMax >= 2) fraudeDetectee = true; // CAS 1 & 3 : Retrait depuis le milieu ou la fin
+          if (etatBinaire == 2) { 
+              if (etapeMax == 0) etapeMax = 1; 
+              else if (etapeMax >= 2) fraudeDetectee = true; 
           }
-          else if (etatBinaire == 3) { // 00 (Les deux coupés, milieu)
-              if (etapeMax == 1) etapeMax = 2; // Avancée normale
-              else if (etapeMax >= 3) fraudeDetectee = true; // CAS 1 : Recul depuis la sortie vers le milieu
+          else if (etatBinaire == 3) { 
+              if (etapeMax == 1) etapeMax = 2; 
+              else if (etapeMax >= 3) fraudeDetectee = true; 
           }
-          else if (etatBinaire == 1) { // 10 (Seul VAL2 coupé, sortie)
-              if (etapeMax == 1 || etapeMax == 2) etapeMax = 3; // Avancée normale
+          else if (etatBinaire == 1) { 
+              if (etapeMax == 1 || etapeMax == 2) etapeMax = 3; 
           }
-          else if (etatBinaire == 0) { // 11 (Tapis vide)
-              // VICTOIRE
+          else if (etatBinaire == 0) { 
               if (etapeMax == 3 || etapeMax == 2) { 
                  bouteille_validee = true;
                  Serial.println(">>> Bouteille a quitté le tapis. Chute en cours...");
                  currentState = ATTENTE_CHUTE;
                  timerEtat = millis();
               }
-              // CAS 2 : Retrait total depuis l'entrée
               else if (etapeMax == 1) {
                  fraudeDetectee = true; 
               }
           }
 
-          // GESTION DU REJET POUR FRAUDE
           if (fraudeDetectee) {
              Serial.println(">>> 🛑 FRAUDE DÉTECTÉE (Mouvement anormal) !");
              if (mqttClient.connected()) mqttClient.publish("ecobox/rejet", "FRAUDE");
+             tempsDeRejet = 11000; // Rejet long car elle est rentrée sur le tapis
              moteur.stopper();
              currentState = ATTENTE_REJET;
              timerEtat = millis();
@@ -279,6 +294,7 @@ class ControllerCrystaRecycle {
           if (millis() - timerEtat > 15000) {
              Serial.println(">>> TIMEOUT GLOBAL -> Bouteille coincée");
              if (mqttClient.connected()) mqttClient.publish("ecobox/rejet", "TIMEOUT_CONVOYEUR");
+             tempsDeRejet = 11000; // Rejet long
              moteur.stopper();
              currentState = ATTENTE_REJET;
              timerEtat = millis();
@@ -287,13 +303,13 @@ class ControllerCrystaRecycle {
         }
 
         case ATTENTE_CHUTE: {
-          // CAS 4 : Surveillance pendant la chute de 500ms
           bool ir1_chute = capteurVoitBouteille(PIN_IR_VALIDATION_1, timerPerteVal1);
           bool ir2_chute = capteurVoitBouteille(PIN_IR_VALIDATION_2, timerPerteVal2);
           
           if (ir1_chute || ir2_chute) {
-             Serial.println(">>> 🛑 FRAUDE EXTRÊME (Cas 4) : Bouteille remontée avec une ficelle !");
+             Serial.println(">>> 🛑 FRAUDE EXTRÊME : Bouteille remontée avec une ficelle !");
              if (mqttClient.connected()) mqttClient.publish("ecobox/rejet", "FRAUDE");
+             tempsDeRejet = 11000; // Rejet long
              moteur.stopper();
              currentState = ATTENTE_REJET;
              timerEtat = millis();
@@ -332,7 +348,9 @@ class ControllerCrystaRecycle {
         case ATTENTE_REJET:
           moteur.stopper();
           if (millis() - timerEtat > 1000) {
-            Serial.println(">>> Fin pause. Lancement MARCHE ARRIÈRE (10s).");
+            Serial.print(">>> Fin pause. Lancement MARCHE ARRIÈRE (");
+            Serial.print(tempsDeRejet / 1000);
+            Serial.println("s).");
             currentState = REJET_EN_COURS;
             timerEtat = millis();
             moteur.reculer();
@@ -340,8 +358,9 @@ class ControllerCrystaRecycle {
           break;
 
         case REJET_EN_COURS:
-          if (millis() - timerEtat > 11000) {
-            Serial.println(">>> Fin du rejet.");
+          // NOUVEAU : On utilise la variable tempsDeRejet au lieu de 11000 en dur
+          if (millis() - timerEtat > tempsDeRejet) {
+            Serial.println(">>> Fin du rejet automatique.");
             moteur.stopper();
             currentState = BORNE_PRETE;
           }
@@ -364,18 +383,45 @@ class ControllerCrystaRecycle {
 
 ControllerCrystaRecycle maBorne;
 
+void receptionOrdreServeur(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.print(">>> Ordre serveur reçu sur [");
+  Serial.print(topic);
+  Serial.print("] : ");
+  Serial.println(message);
+
+  if (String(topic) == "ecobox/action") {
+    if (message == "STOP_TAPIS") {
+      maBorne.forcerActionServeur();
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Wire.begin(SDA_PIN_sfr02, SCL_PIN_sfr02);
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   ScannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX_PIN, SCANNER_TX_PIN);
+  
   maBorne.init();
   attachInterrupt(digitalPinToInterrupt(PIN_IR_ENTREE), ISR_Entree, FALLING);
+  
   Ethernet.init(W5500_CS_PIN); 
-  if (Ethernet.begin(mac) == 0) Serial.println(">>> ❌ Échec DHCP");
-  else { Serial.print(">>> ✅ Connecté IP : "); Serial.println(Ethernet.localIP()); }
+  if (Ethernet.begin(mac) == 0) {
+    Serial.println(">>> ❌ Échec DHCP");
+  } else { 
+    Serial.print(">>> ✅ Connecté IP : "); 
+    Serial.println(Ethernet.localIP()); 
+  }
+  
   mqttClient.setServer(brokerIP, 1883);
-  Serial.println("=== SYSTÈME DÉMARRÉ (ANTI-FRAUDE ULTIME) ===");
+  mqttClient.setCallback(receptionOrdreServeur);
+  
+  Serial.println("=== SYSTÈME DÉMARRÉ (REJET DYNAMIQUE) ===");
 }
 
 void loop() {
