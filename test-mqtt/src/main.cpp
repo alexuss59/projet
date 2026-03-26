@@ -50,8 +50,8 @@ void IRAM_ATTR ISR_Entree() {
 // MACHINE À ÉTATS
 // =================================================================
 enum State {
-  ATTENTE_UTILISATEUR, // Démarrage par défaut : Veille logicielle (Verrouillé)
-  BORNE_PRETE,         // Session active (Prêt à détecter)
+  ATTENTE_UTILISATEUR,
+  BORNE_PRETE,
   BOUTEILLE_DETECTEE,
   DEPOT_VALIDE,
   ATTENTE_CHUTE,
@@ -117,23 +117,44 @@ public:
   }
 };
 
+// --- CORRECTION DU BUG DES LEDS ICI ---
 class LedController {
 private:
   bool clignotement = false;
+  State dernierEtat = ATTENTE_UTILISATEUR; // Mémoire de l'ancien état
+  bool forceUpdate = true;
+
 public:
   void afficherEtat(State etat) {
     static unsigned long lastBlink = 0;
-    if (millis() - lastBlink > 300) { clignotement = !clignotement; lastBlink = millis(); }
-    switch (etat) {
-      case ATTENTE_UTILISATEUR: fill_solid(leds, NUM_LEDS, CRGB::Black); break; // Noir en veille
-      case BORNE_PRETE: case ATTENTE_CHUTE: fill_solid(leds, NUM_LEDS, CRGB::Green); break;
-      case BOUTEILLE_DETECTEE: fill_solid(leds, NUM_LEDS, CRGB::Blue); break;
-      case DEPOT_VALIDE: fill_solid(leds, NUM_LEDS, clignotement ? CRGB::Blue : CRGB::Black); break;
-      case ATTENTE_REJET: case REJET_EN_COURS: fill_solid(leds, NUM_LEDS, clignotement ? CRGB::Red : CRGB::Black); break;
-      case BAC_PLEIN: fill_solid(leds, NUM_LEDS, CRGB::Red); break;
+    bool blinkChanged = false;
+
+    if (millis() - lastBlink > 300) { 
+      clignotement = !clignotement; 
+      lastBlink = millis(); 
+      blinkChanged = true;
     }
-    FastLED.show();
+
+    // On n'envoie l'ordre aux LEDs QUE si l'état change OU si on doit clignoter.
+    // Ça libère le processeur pour le MQTT lors de la synchronisation !
+    if (etat != dernierEtat || forceUpdate || ((etat == DEPOT_VALIDE || etat == ATTENTE_REJET || etat == REJET_EN_COURS) && blinkChanged)) {
+        
+        switch (etat) {
+          case ATTENTE_UTILISATEUR: fill_solid(leds, NUM_LEDS, CRGB::Purple); break;
+          case BORNE_PRETE: case ATTENTE_CHUTE: fill_solid(leds, NUM_LEDS, CRGB::Green); break;
+          case BOUTEILLE_DETECTEE: fill_solid(leds, NUM_LEDS, CRGB::Blue); break;
+          case DEPOT_VALIDE: fill_solid(leds, NUM_LEDS, clignotement ? CRGB::Blue : CRGB::Black); break;
+          case ATTENTE_REJET: case REJET_EN_COURS: fill_solid(leds, NUM_LEDS, clignotement ? CRGB::Red : CRGB::Black); break;
+          case BAC_PLEIN: fill_solid(leds, NUM_LEDS, CRGB::Red); break;
+        }
+        
+        FastLED.show(); // Exécuté uniquement quand c'est strictement nécessaire
+        dernierEtat = etat;
+        forceUpdate = false;
+    }
   }
+
+  void forcerActualisation() { forceUpdate = true; } // Outil de sécurité
 };
 
 class ScannerService {
@@ -175,6 +196,8 @@ private:
   unsigned long tempsDeRejet;
   unsigned long timerPerteVal1, timerPerteVal2;
   unsigned long lastBinCheck = 0;
+  
+  bool demandeFermeture = false; 
 
   bool verifierSiPlein() {
     if (millis() - lastBinCheck > 5000) {
@@ -203,44 +226,55 @@ public:
   }
 
   void gererSession(String cmd) {
-    if (cmd == "ACTIVER_BORNE" && etatActuel == ATTENTE_UTILISATEUR) {
-      int dist = ultrason.lireDistance();
-      if (dist > 0 && dist <= HAUTEUR_BAC_PLEIN) {
-        Serial.println(">>> ❌ REFUS : Bac plein.");
-        mqtt.publier("ecobox/alerte", "BAC_PLEIN_START_REFUSED");
-        etatActuel = BAC_PLEIN;
-        return;
+    if (cmd == "ACTIVER_BORNE") {
+      demandeFermeture = false; 
+      if (etatActuel == ATTENTE_UTILISATEUR) {
+        int dist = ultrason.lireDistance();
+        if (dist > 0 && dist <= HAUTEUR_BAC_PLEIN) {
+          Serial.println(">>> ❌ REFUS : Bac plein.");
+          mqtt.publier("ecobox/alerte", "BAC_PLEIN_START_REFUSED");
+          etatActuel = BAC_PLEIN;
+          return;
+        }
+        Serial.println(">>> ✅ SESSION ACTIVÉE");
+        etatActuel = BORNE_PRETE;
+        ledCtrl.forcerActualisation(); // FORCE LA LED À PASSER AU VERT INSTANTANÉMENT
       }
-      Serial.println(">>> ✅ SESSION ACTIVÉE");
-      etatActuel = BORNE_PRETE;
     }
     else if (cmd == "DESACTIVER_BORNE") {
-      Serial.println(">>> 🛑 SESSION TERMINÉE (Ou borne verrouillée par l'IHM)");
-      moteur.stopper();
-      resetTracking();
-      etatActuel = ATTENTE_UTILISATEUR;
+      if (etatActuel == BORNE_PRETE || etatActuel == ATTENTE_UTILISATEUR) {
+        Serial.println(">>> 🛑 SESSION TERMINÉE IMMEDIATEMENT");
+        moteur.stopper();
+        resetTracking();
+        etatActuel = ATTENTE_UTILISATEUR;
+      } 
+      else {
+        Serial.println(">>> ⏳ DESACTIVATION MISE EN ATTENTE (Moteur en cours)");
+        demandeFermeture = true; 
+      }
     }
   }
 
   void forcerActionServeur() {
-    Serial.println(">>> 🛑 ACTION SERVEUR : STOP_TAPIS (Arrêt d'urgence).");
-    moteur.stopper(); resetTracking(); etatActuel = BORNE_PRETE;
+    Serial.println(">>> 🔄 ACTION SERVEUR : STOP_TAPIS (Réessayer).");
+    moteur.stopper(); 
+    resetTracking(); 
+    demandeFermeture = false; 
+    etatActuel = BORNE_PRETE; 
+    ledCtrl.forcerActualisation();
   }
 
   void executerCycle() {
-    ledCtrl.afficherEtat(etatActuel);
+    // CORRECTION LOGIQUE : On traite les messages réseau D'ABORD, on affiche l'état ENSUITE.
     mqtt.loop();
+    ledCtrl.afficherEtat(etatActuel);
 
-    // 1. CORRECTION DU BUG "DÉTECTEUR FANTÔME" (Redéclenchement)
-    // Si la borne est en train de traiter une bouteille (ou en veille),
-    // on vide continuellement l'interruption pour ignorer les faux-positifs.
     if (etatActuel != BORNE_PRETE) {
       portENTER_CRITICAL(&myMux); 
       interruptionEntree = false; 
       portEXIT_CRITICAL(&myMux);
     }
 
-    // 2. Surveillance du bac (même en veille)
     if (etatActuel == ATTENTE_UTILISATEUR || etatActuel == BORNE_PRETE) {
         if (verifierSiPlein()) {
             etatActuel = BAC_PLEIN;
@@ -248,13 +282,11 @@ public:
         }
     }
 
-    // 3. Verrouillage si en veille
     if (etatActuel == ATTENTE_UTILISATEUR) {
       moteur.stopper();
       return;
     }
 
-    // 4. Exécution des états
     switch (etatActuel) {
       case BAC_PLEIN:
         moteur.stopper();
@@ -290,7 +322,6 @@ public:
             timerEtat = millis();
           }
         }
-        // CORRECTION : Remise en place du message d'erreur TIMEOUT SCAN
         if (millis() - timerEtat > 3000) {
           Serial.println(">>> ⚠️ ERREUR : Bouteille illisible (Timeout 3s).");
           mqtt.publier("ecobox/rejet", "TIMEOUT_SCAN"); 
@@ -307,7 +338,6 @@ public:
           int bin = (ir1 ? 2 : 0) | (ir2 ? 1 : 0);
           bool fraude = false;
 
-          // Suivi de l'avancement de la bouteille
           if (bin == 2) { 
               if (etapeMax == 0) etapeMax = 1; 
               else if (etapeMax >= 2) fraude = true; 
@@ -324,11 +354,10 @@ public:
               etatActuel = ATTENTE_CHUTE; 
               timerEtat = millis();
             } else if (etapeMax == 1) {
-              fraude = true; // La bouteille a disparu après le premier capteur
+              fraude = true; 
             }
           }
 
-          // CORRECTION : Remise en place des envois de messages FRAUDE et TIMEOUT CONVOYEUR
           if (fraude) {
             Serial.println(">>> 🛑 FRAUDE DÉTECTÉE (Mouvement anormal) !");
             mqtt.publier("ecobox/rejet", "FRAUDE");
@@ -336,7 +365,7 @@ public:
             etatActuel = ATTENTE_REJET; 
             timerEtat = millis();
           } 
-          else if (millis() - timerEtat > 15000) { // Timeout si la bouteille est coincée sur le tapis
+          else if (millis() - timerEtat > 15000) { 
             Serial.println(">>> ⏱ TIMEOUT CONVOYEUR : Bouteille coincée !");
             mqtt.publier("ecobox/rejet", "TIMEOUT_CONVOYEUR");
             tempsDeRejet = 11000; 
@@ -352,7 +381,14 @@ public:
           mqtt.publier("ecobox/accepte", "OK");
           int d = ultrason.lireDistance();
           mqtt.publier("ecobox/remplissage", String(ultrason.calculerTauxRemplissage(d)));
-          etatActuel = BORNE_PRETE;
+          
+          if (demandeFermeture) {
+             Serial.println(">>> 🛑 Verrouillage différé appliqué.");
+             etatActuel = ATTENTE_UTILISATEUR;
+             demandeFermeture = false;
+          } else {
+             etatActuel = BORNE_PRETE;
+          }
         }
         break;
 
@@ -366,7 +402,14 @@ public:
       case REJET_EN_COURS:
         if (millis() - timerEtat > tempsDeRejet) {
           moteur.stopper(); 
-          etatActuel = BORNE_PRETE;
+          
+          if (demandeFermeture) {
+             Serial.println(">>> 🛑 Verrouillage différé appliqué (Fin du rejet).");
+             etatActuel = ATTENTE_UTILISATEUR;
+             demandeFermeture = false;
+          } else {
+             etatActuel = BORNE_PRETE;
+          }
         }
         break;
     }
@@ -399,6 +442,8 @@ SystemManager systeme;
 void receptionOrdreServeur(char *topic, byte *payload, unsigned int length) {
   String msg = "";
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  
+  msg.trim(); 
   String top = String(topic);
 
   Serial.print(">>> [MQTT REÇU] Topic : "); 
