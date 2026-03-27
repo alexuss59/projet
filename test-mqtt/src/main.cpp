@@ -117,7 +117,6 @@ public:
   }
 };
 
-// --- CORRECTION DU BUG DES LEDS ICI ---
 class LedController {
 private:
   bool clignotement = false;
@@ -135,8 +134,6 @@ public:
       blinkChanged = true;
     }
 
-    // On n'envoie l'ordre aux LEDs QUE si l'état change OU si on doit clignoter.
-    // Ça libère le processeur pour le MQTT lors de la synchronisation !
     if (etat != dernierEtat || forceUpdate || ((etat == DEPOT_VALIDE || etat == ATTENTE_REJET || etat == REJET_EN_COURS) && blinkChanged)) {
         
         switch (etat) {
@@ -148,13 +145,13 @@ public:
           case BAC_PLEIN: fill_solid(leds, NUM_LEDS, CRGB::Red); break;
         }
         
-        FastLED.show(); // Exécuté uniquement quand c'est strictement nécessaire
+        FastLED.show(); 
         dernierEtat = etat;
         forceUpdate = false;
     }
   }
 
-  void forcerActualisation() { forceUpdate = true; } // Outil de sécurité
+  void forcerActualisation() { forceUpdate = true; }
 };
 
 class ScannerService {
@@ -210,9 +207,14 @@ private:
 
   void resetTracking() { etapeMax = 0; tempsDeRejet = 11000; scanner.reinitialiser(); }
   
+  // --- LISSAGE DE 30ms INTÉGRÉ ICI ---
   bool capteurVoitBouteille(int pin, unsigned long &timer) {
-    if (digitalRead(pin) == HIGH) { timer = millis(); return true; }
-    return (millis() - timer < 50);
+    if (digitalRead(pin) == HIGH) { 
+      timer = millis(); 
+      return true; 
+    }
+    // Tolérance de 30ms pour ignorer les reflets et les creux du plastique PET
+    return (millis() - timer < 30); 
   }
 
 public:
@@ -238,7 +240,7 @@ public:
         }
         Serial.println(">>> ✅ SESSION ACTIVÉE");
         etatActuel = BORNE_PRETE;
-        ledCtrl.forcerActualisation(); // FORCE LA LED À PASSER AU VERT INSTANTANÉMENT
+        ledCtrl.forcerActualisation(); 
       }
     }
     else if (cmd == "DESACTIVER_BORNE") {
@@ -265,7 +267,6 @@ public:
   }
 
   void executerCycle() {
-    // CORRECTION LOGIQUE : On traite les messages réseau D'ABORD, on affiche l'état ENSUITE.
     mqtt.loop();
     ledCtrl.afficherEtat(etatActuel);
 
